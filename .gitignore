@@ -1,0 +1,4 @@
+/build
+/main/local_config.h
+/sdkconfig.old
+*.kate-swp
