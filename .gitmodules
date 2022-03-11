@@ -1,0 +1,6 @@
+[submodule "lib/flac"]
+	path = lib/flac/flac
+	url = https://github.com/xiph/flac.git
+[submodule "lib/opus"]
+	path = lib/opus/opus
+	url = https://github.com/xiph/opus.git
