@@ -1,0 +1,9 @@
+menu "Project Configuration"
+
+#    config ESP_WIFI_SSID
+#        string "WiFi SSID"
+#        default "myssid"
+#        help
+#            SSID (network name) for the example to connect to.
+
+endmenu
