@@ -198,11 +198,13 @@ void app_player_manager(void *pvParameters)
 		{
 			if (event.type == I2S_EVENT_TX_DONE)
 			{
-				if (tx_pending < PLAYER_DMA_BUF_SIZE_SAMPLES)
+				if (tx_pending <= PLAYER_DMA_BUF_SIZE_SAMPLES)
 				{
-					tx_pending = 0;
+					tx_pending = PLAYER_DMA_BUF_SIZE_SAMPLES;
 					// This is actually not okay as it should be padding zeros with enough space to
-					// prevent running out of space.
+					// prevent running out of buffers.  If it does underrun, that means it grabbed
+					// some random buffer so there should still be PLAYER_DMA_BUF_SIZE_SAMPLES
+					// queued, from a latency perspective.
 					ESP_LOGE(TAG, "i2s DMA underrun");
 				}
 				else
