@@ -100,6 +100,7 @@ typedef struct PlayerCtrl
 	
 } PlayerCtrl;
 
+static uint32_t s_exists = 0;
 static PlayerCtrl s_player_ctrl;
 
 static uint8_t s_zero_samples[4 * PLAYER_DMA_BUF_ZEROS_SAMPLES];
@@ -325,6 +326,17 @@ void app_player_manager(void *pvParameters)
 
 int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_sizes)
 {
+	if (s_exists)
+	{
+		ScPacketWireChunk *old;
+		while (xQueueReceive(s_player_ctrl.chunk_queue, &old, 0) == pdPASS)
+		{
+			free(old);
+		}
+	}
+	
+	s_exists = 1;
+	
 	// Should be in BSS and be zeroed, but just to be sure...
 	bzero(s_zero_samples, 4 * PLAYER_DMA_BUF_ZEROS_SAMPLES);
 	
