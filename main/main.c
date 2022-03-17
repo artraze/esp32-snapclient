@@ -30,6 +30,8 @@ void app_main(void)
 	}
 	ESP_ERROR_CHECK(ret);
 	
+	app_util_init();
+	
 	app_wifi_init_sta();
 	
 	app_snapclient_init();

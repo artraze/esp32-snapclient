@@ -7,6 +7,7 @@
 #include "driver/i2s.h"
 #include "FLAC/stream_decoder.h"
 #include "opus.h"
+#include "time_model.h"
 #include <string.h>
 
 static const char *TAG = "app_player";
@@ -24,6 +25,11 @@ static const char *TAG = "app_player";
 // routine.  It must be greater than DMA_BUF_SIZE_SAMPLES, and probably should be several times
 // that (since the service routine is only invoked when a DMA buffer is consumed).
 #define PLAYER_PLAYBACK_BUF_SAMPLES_MIN             5500
+
+// This is the minimum time error (in samples) to correct.  Anything smaller will be ignored
+// in the hope that it's just transient time sync error that will just as likely drift the other
+// way.  This prevents injecting samples one cycle just to remove them on the next.
+#define PLAYER_PLAYBACK_SAMPLE_JITTER_MIN           120
 
 // Size of the individual DMA buffers.  They are limited to 4092 bytes (but annoying only throw
 // an error if >4096, which burnt me) so 1023 for 2ch, 16b.  The longer the buffer, the fewer
@@ -79,6 +85,10 @@ typedef struct PlayerCtrl
 	
 	QueueHandle_t chunk_queue;
 	
+	TimeModel time_model;
+	uint32_t sync_status;
+	SemaphoreHandle_t time_mutex;
+	
 	uint8_t codec;
 	uint8_t muted;
 	uint8_t volume;
@@ -95,13 +105,30 @@ static PlayerCtrl s_player_ctrl;
 static uint8_t s_zero_samples[4 * PLAYER_DMA_BUF_ZEROS_SAMPLES];
 static int16_t s_decode_samples[2 * PLAYER_MAX_FRAME_SAMPLES];
 
+static uint64_t scc_time_get_us()
+{
+	xSemaphoreTake(s_player_ctrl.time_mutex, portMAX_DELAY);
+	uint64_t time = xtime_calc(&s_player_ctrl.time_model, app_read_systimer_unit1());
+	xSemaphoreGive(s_player_ctrl.time_mutex);
+	return time;
+}
+
 static void app_player_fill_zeros(uint32_t samples)
 {
+	uint32_t t0 = app_read_systimer_unit1()/16000;
 	while (samples)
 	{
 		size_t size = (samples > PLAYER_DMA_BUF_ZEROS_SAMPLES ? PLAYER_DMA_BUF_ZEROS_SAMPLES : samples);
 		ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, s_zero_samples, 4 * size, &size, 100));
 		samples -= size / 4;
+	}
+	uint32_t t1 = app_read_systimer_unit1()/16000;
+	if (t1 - t0 > 5)
+	{
+		// If this waited for a buffer than the system is dead.  It means the open loop prediction
+		// of samples currently in the I2S queue was wrong and there's almost no way of salvaging
+		// it a this point.
+		ESP_LOGW(TAG, "app_player_fill_zeros - filling took %ims", t1 - t0);
 	}
 }
 
@@ -111,6 +138,18 @@ void app_player_set_params(uint32_t buffer_ms, uint32_t latency_ms, uint8_t mute
 	s_player_ctrl.latency_ms = latency_ms;
 	s_player_ctrl.muted = muted;
 	s_player_ctrl.volume = volume;
+}
+
+void app_player_set_time_model(const TimeModel *model)
+{
+	if (!s_player_ctrl.sync_status)
+	{
+		ESP_LOGI(TAG, "got initial time sync");
+	}
+	xSemaphoreTake(s_player_ctrl.time_mutex, portMAX_DELAY);
+	memcpy(&s_player_ctrl.time_model, model, sizeof(TimeModel));
+	s_player_ctrl.sync_status = 1;
+	xSemaphoreGive(s_player_ctrl.time_mutex);
 }
 
 int app_player_enqueue_chunk(ScPacketWireChunk *chunk)
@@ -173,13 +212,62 @@ void app_player_manager(void *pvParameters)
 			}
 		}
 		
+		// TODO: This `now` is probably pretty sketchy since this needs to wakeup after the ISR and
+		// read the queue.  Hopefully that's a fairly small and reasonably deterministic delay but
+		// isn't ideal.  It's fine for now as this isn't compensating for round trip time, but if
+		// that gets to be something it supports, it needs a better time source.  That probably
+		// means calculating the sysclk value based on number of samples sent, but maybe it could be
+		// captured at the I2S interrupt if I rewrite the i2s driver like I want to.
+		uint64_t now = scc_time_get_us();
+		
+		if (!s_player_ctrl.sync_status)
+		{
+			ESP_LOGI(TAG, "time sync pending");
+		}
+		
 		// ESP_LOGE(TAG, "queue chunk (count = %i, free mem = %i)", uxQueueMessagesWaiting(s_player_ctrl.chunk_queue), esp_get_free_heap_size());
 		for (ScPacketWireChunk *chunk;
+				s_player_ctrl.sync_status &&
 				tx_pending < PLAYER_PLAYBACK_BUF_SAMPLES_MIN &&
 				xQueueReceive(s_player_ctrl.chunk_queue, &chunk, 0) == pdTRUE;
 			 free(chunk))
 		{
+			//ESP_LOGE(TAG, "wire chunk buffer reading len = %i", s_player_ctrl.chunk_buf_count);
+			int64_t  play_time     = TV_2_US(chunk->timestamp);
+			int64_t  play_offset  = (s_player_ctrl.buffer_ms - s_player_ctrl.latency_ms) * 1000LL + play_time - now;
+			int64_t  sample_offset = play_offset * 48000 / 1000000;
 			uint32_t nsamples = 0;
+			//ESP_LOGE(TAG, "testing a chunk @ (time-now)==%lli (time=%lli, now=%lli)", play_offset, play_time, now);
+			if (sample_offset < 0)
+			{
+				// In theory there could be useful samples at the end of the chunk even if the start
+				// is negative, but the buffer is underrunning so better to try and start fresh than
+				// salvage the tail of a chunk.
+				ESP_LOGW(TAG, "discarded a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, s_player_ctrl.buffer_ms, s_player_ctrl.latency_ms);
+				continue;
+			}
+			if (sample_offset > PLAYER_PLAYBACK_BUF_SAMPLES_MIN)
+			{
+				// This means that the chunk is scheduled to be played further in the future than
+				// we buffer for I2S.  So if shouldn't be played now and instead deferred.  The
+				// DMA buffer will be filled with zeros as needed.
+				if (xQueueSendToFront(s_player_ctrl.chunk_queue, &chunk, 0) != pdTRUE)
+				{
+					// The buffer is full but the front chunk is still in the future.  That probably
+					// means the number of chunks needed to be buffered `buffer_ms/chunk_ms` is
+					// larger than PLAYER_CHUNK_BUF_LEN (less BUF_SAMPLES_MIN).
+					ESP_LOGE(TAG, "discarded a future chunk due to full buffer?!");
+					free(chunk);
+				}
+				ESP_LOGI(TAG, "replaced future buf @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, s_player_ctrl.buffer_ms, s_player_ctrl.latency_ms);
+				break;
+			}
+			if (tx_pending + PLAYER_PLAYBACK_SAMPLE_JITTER_MIN < sample_offset)
+			{
+				ESP_LOGI(TAG, "padding for chunk play (tx_pending=%i, sample_offset=%i", tx_pending, sample_offset);
+				app_player_fill_zeros(sample_offset - tx_pending);
+				tx_pending = sample_offset;
+			}
 			//ESP_LOGI(TAG, "playing a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli)", sample_offset, play_offset, play_time, now);
 			if (s_player_ctrl.codec == PLAYER_CODEC_OPUS)
 			{
@@ -236,6 +324,7 @@ int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_s
 	// Should be in BSS and be zeroed, but just to be sure...
 	bzero(s_zero_samples, 4 * PLAYER_DMA_BUF_ZEROS_SAMPLES);
 	
+	s_player_ctrl.sync_status = 0;
 	s_player_ctrl.codec = codec;
 	s_player_ctrl.buffer_ms = 0;
 	s_player_ctrl.latency_ms = 0;
@@ -290,6 +379,8 @@ int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_s
 			ESP_LOGE(TAG, "unknown codec %i", codec);
 			return 1;
 	}
+	
+	s_player_ctrl.time_mutex = xSemaphoreCreateMutex();
 	
 	s_player_ctrl.chunk_queue = xQueueCreate(PLAYER_CHUNK_BUF_LEN, sizeof(ScPacketWireChunk*));
 	

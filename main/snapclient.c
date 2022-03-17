@@ -6,8 +6,17 @@
 #include "esp_log.h"
 #include "lwip/sockets.h"
 #include "driver/i2s.h"
+#include "time_model.h"
 
 static const char *TAG = "snapclient";
+
+// #define TIME_DBG_SAMPLES      800
+#ifdef TIME_DBG_SAMPLES
+static uint32_t s_time_dbg_count = 0;
+static uint64_t s_time_dbg_remote[TIME_DBG_SAMPLES];
+static uint64_t s_time_dbg_local[TIME_DBG_SAMPLES];
+static uint64_t s_time_dbg_ticks[TIME_DBG_SAMPLES];
+#endif
 
 #define SNAPCAST_MESSAGE_TYPE_BASE               0
 #define SNAPCAST_MESSAGE_TYPE_CODEC_HEADER       1
@@ -38,8 +47,16 @@ typedef struct __attribute__((packed)) ScPacketWireChunk
 	uint8_t payload[0];      // Buffer of data containing the encoded PCM data (a decodable chunk per message)
 } ScPacketWireChunk;
 
+typedef struct __attribute__((packed)) ScPacketTime
+{
+	int32_t latency_sec;
+	int32_t latency_usec;
+} ScPacketTime;
+
 typedef struct ScClientState
 {
+	TimeModelState time_state;
+	
 	// Server settings fields
 	uint32_t buffer_ms;
 	uint32_t latency;
@@ -134,6 +151,19 @@ static int scc_send_msg_hello(int sock)
 	return 0;
 }
 
+static int scc_send_msg_time(int sock)
+{
+	ScPacketTime latency;
+	
+	if (scc_send_hdr(sock, SNAPCAST_MESSAGE_TYPE_TIME, sizeof(ScPacketTime)) <= 0 ||
+		write(sock, &latency, sizeof(ScPacketTime)) <= 0 )
+	{
+		ESP_LOGE(TAG, "time message failed to send");
+		return 1;
+	}
+	return 0;
+}
+
 static int scc_recv_hdr(int sock, ScPacketHdr *hdr)
 {
 	while (1)
@@ -144,12 +174,41 @@ static int scc_recv_hdr(int sock, ScPacketHdr *hdr)
 			if (errno == EAGAIN)
 			{
 				ESP_LOGI(TAG, "header recv timed out, looping");
+				// TODO: the time message is kind of a keep-alive so send it on timeout.  This
+				// could probably be in a better spot.
+				scc_send_msg_time(sock);
+#ifdef TIME_DBG_SAMPLES
+				if (s_time_dbg_count > TIME_DBG_SAMPLES / 2)
+				{
+					printf("time_samples=[");
+					for (uint32_t i = 0; i < s_time_dbg_count; i++)
+						printf("(%lli, %lli, %lli),", s_time_dbg_ticks[i], s_time_dbg_local[i], s_time_dbg_remote[i]);
+					printf("]\n");
+					s_time_dbg_count = 0;
+				}
+#endif
 				continue;
 			}
 			ESP_LOGE(TAG, "header recv failed: r=%i, errno=%i(%s)", r, errno, strerror(errno));
 			return 1;
 		}
 		// TODO: populate recv time
+		// Add the remote clock instance
+		uint64_t time = TV_2_US(hdr->sent);
+		uint64_t clock = app_read_systimer_unit1();
+		if (xtime_add_observation(&s_state.time_state, time, clock))
+		{
+			app_player_set_time_model(&s_state.time_state.model);
+		}
+#ifdef TIME_DBG_SAMPLES
+		if (s_time_dbg_count < TIME_DBG_SAMPLES)
+		{
+			s_time_dbg_remote[s_time_dbg_count] = time;
+			s_time_dbg_local[s_time_dbg_count] = xtime_calc(&s_state.time_state.model, clock);
+			s_time_dbg_ticks[s_time_dbg_count] = clock;
+			s_time_dbg_count++;
+		}
+#endif
 		return 0;
 	}
 }
@@ -313,7 +372,7 @@ void app_snapclient_task(void *pvParameters)
 		}
 		ESP_LOGI(TAG, "sent hello");
 
-		if (sock_set_timeout(sock, SO_RCVTIMEO, 5000) < 0)
+		if (sock_set_timeout(sock, SO_RCVTIMEO, 2000) < 0)
 		{
 			ESP_LOGE(TAG, "set recv timeout failed: errno=%i(%s)", errno, strerror(errno));
 			continue;
@@ -387,6 +446,10 @@ void app_snapclient_task(void *pvParameters)
 
 void app_snapclient_init(void)
 {
+	s_state.time_state.sync_status = 0;
+	s_state.time_state.n_samples_filt = 0;
+	s_state.time_state.n_samples_raw = 0;
+	
 	s_state.buffer_ms = 1000;
 	s_state.latency   = 0;
 	s_state.muted     = 1;

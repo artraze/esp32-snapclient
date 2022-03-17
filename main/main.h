@@ -23,6 +23,7 @@
 
 
 struct ScPacketWireChunk;
+struct TimeModel;
 
 // wifi.c
 void app_wifi_init_sta(void);
@@ -32,11 +33,18 @@ void app_wifi_init_sta(void);
 #define PLAYER_CODEC_FLAC                      1
 #define PLAYER_CODEC_OPUS                      2
 void app_player_set_params(uint32_t buffer_ms, uint32_t latency_ms, uint8_t muted, uint8_t volume);
+void app_player_set_time_model(const struct TimeModel *model);
 int app_player_enqueue_chunk(struct ScPacketWireChunk *chunk);
 int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_sizes);
 
 // snapclient.c
 void app_snapclient_init(void);
 
+// time.c
+void app_sntp_init(void);
+uint64_t app_time_get_us(void);
+
 // utils.c
 cJSON *util_parse_json(const char *buffer, uint32_t size, const char *log_title);
+uint64_t app_read_systimer_unit1();
+void app_util_init();
