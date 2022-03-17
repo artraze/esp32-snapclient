@@ -399,7 +399,7 @@ void app_snapclient_task(void *pvParameters)
 			if (!body)
 			{
 				// TODO: this needn't be fatal
-				ESP_LOGE(TAG, "failed to allocate buffer for message body (size=%i)", hdr.size);
+				ESP_LOGE(TAG, "failed to allocate buffer for message body (size=%i, free=%i)", hdr.size, esp_get_free_heap_size());
 				break;
 			}
 			r = sock_recv_loop(sock, body, hdr.size);

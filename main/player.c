@@ -41,7 +41,7 @@ static const char *TAG = "app_player";
 // This needs to be large enough to hold the worst case, which would be something like
 // SAMPLES_MIN + MAX_FRAME (i.e. decoding a frame when the buffered data just dips below the
 // needs-service threshold.
-#define PLAYER_DMA_BUF_COUNT                        20
+#define PLAYER_DMA_BUF_COUNT                        16
 
 // This is the maximum number chunks to queue.  Unfortunately what this practically means depends
 // on the chunk/frame size the server is using (which it doesn't advertise).  This doesn't
@@ -178,6 +178,18 @@ int app_player_enqueue_chunk(ScPacketWireChunk *chunk)
 		}
 		//ESP_LOGW(TAG, "chunk buffer overflow");
 	}
+	// This seems to be primarily a fragmentation issue but the heap free is far easier to determine
+	while (esp_get_free_heap_size() < 30000)
+	{
+		ESP_LOGW(TAG, "memory low (%i), discarding chunk", esp_get_free_heap_size());
+		ScPacketWireChunk *old;
+		if (xQueueReceive(s_player_ctrl.chunk_queue, &old, 0) != pdPASS)
+		{
+			ESP_LOGW(TAG, "memory low complete");
+			break;
+		}
+		free(old);
+	}
 	return (rsend == pdTRUE);
 }
 
@@ -241,6 +253,7 @@ void app_player_manager(void *pvParameters)
 			int64_t  play_time     = TV_2_US(chunk->timestamp);
 			int64_t  play_offset  = (s_player_ctrl.buffer_ms - s_player_ctrl.latency_ms) * 1000LL + play_time - now;
 			int64_t  sample_offset = play_offset * 48000 / 1000000;
+			int16_t *samples = NULL;
 			uint32_t nsamples = 0;
 			//ESP_LOGE(TAG, "testing a chunk @ (time-now)==%lli (time=%lli, now=%lli)", play_offset, play_time, now);
 			if (sample_offset < 0)
@@ -274,7 +287,15 @@ void app_player_manager(void *pvParameters)
 				tx_pending = sample_offset;
 			}
 			//ESP_LOGI(TAG, "playing a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli)", sample_offset, play_offset, play_time, now);
-			if (s_player_ctrl.codec == PLAYER_CODEC_OPUS)
+			if (s_player_ctrl.codec == PLAYER_CODEC_PCM)
+			{
+				// PCM is pretty tight.  For best results the chunk_ms on the server should be 20ms
+				// as larger seems to hit heap fragmentation issues.  buffer_ms needs to be ~400ms
+				// in order to ensure enough memory is available overall.
+				nsamples = chunk->size / 4;
+				samples  = chunk->payload;
+ 			}
+			else if (s_player_ctrl.codec == PLAYER_CODEC_OPUS)
 			{
 				assert(s_player_ctrl.opus_decoder);
 				// TODO: Opus specs 120ms as the max frame, but snapcast can probably guarantee less than
@@ -296,6 +317,7 @@ void app_player_manager(void *pvParameters)
 					continue;
 				}
 				nsamples = r;
+				samples  = s_decode_samples;
 			}
 			else
 			{
@@ -305,13 +327,13 @@ void app_player_manager(void *pvParameters)
 			int16_t min=0x7FFF, max=-0x8000;
 			for (int i = 0; i < 2 * nsamples; i++)
 			{
-				int16_t *s = s_decode_samples + i;
+				int16_t *s = samples + i;
 				*s = ((int32_t)*s) * s_player_ctrl.volume / 100 / 8 * (1 - s_player_ctrl.muted);
 				if (*s < min) min = *s;
 				if (*s > max) max = *s;
 			}
 			size_t written = 0;
-			ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, s_decode_samples, 4*nsamples, &written, 100));
+			ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, samples, 4*nsamples, &written, 100));
 			tx_pending += written / 4;
 			// ESP_LOGE(TAG, "Decoded %i samples, write %i bytes", nsamples, written);
 		}
