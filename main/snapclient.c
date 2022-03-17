@@ -1,12 +1,11 @@
 #include "main.h"
 #include <sys/time.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
 #include "driver/i2s.h"
-#include "FLAC/stream_decoder.h"
-#include "opus.h"
 
 static const char *TAG = "snapclient";
 
@@ -18,11 +17,6 @@ static const char *TAG = "snapclient";
 #define SNAPCAST_MESSAGE_TYPE_HELLO              5
 #define SNAPCAST_MESSAGE_TYPE_STREAM_TAGS        6
 #define SNAPCAST_MESSAGE_TYPE_LAST               6
-
-#define SNAPCAST_CODEC_UNKNOWN                   0
-#define SNAPCAST_CODEC_PCM                       1
-#define SNAPCAST_CODEC_FLAC                      2
-#define SNAPCAST_CODEC_OPUS                      3
 
 typedef struct __attribute__((packed)) ScPacketHdr
 {
@@ -44,37 +38,17 @@ typedef struct __attribute__((packed)) ScPacketWireChunk
 	uint8_t payload[0];      // Buffer of data containing the encoded PCM data (a decodable chunk per message)
 } ScPacketWireChunk;
 
-typedef struct RiffHdr
-{
-	uint32_t chunk_id_4cc;    // 'RIFF' fourcc
-	uint32_t chunk_size;      // 
-	uint32_t format_4cc;      // 'WAVE' fourcc
-	uint32_t sub1_id_4cc;     // 'fmt ' fourcc
-	uint32_t sub1_size;       //
-	uint16_t format;          // 1=PCM, otherwise compressed
-	uint16_t num_channels;    // 1, 2, etc
-	uint32_t sample_rate;     // 8000, 44100, 48000, etc
-	uint32_t byte_rate;       // sample_rate * num_channels * sample_bits/8
-	uint16_t block_align;     // num_channels * sample_bits/8
-	uint16_t sample_bits;     // 8, 16, etc
-	uint32_t sub2_id_4cc;     // 'fmt ' fourcc
-	uint32_t sub2_size;       //
-	uint8_t data[0];
-} RiffHdr;
-
 typedef struct ScClientState
 {
-	uint8_t codec;
 	// Server settings fields
 	uint32_t buffer_ms;
 	uint32_t latency;
 	uint8_t muted;
 	uint8_t volume;
-	
-	OpusDecoder *opus_decoder;
-	FLAC__StreamDecoder *flac_decoder;
-	
 } ScClientState;
+
+
+static ScClientState s_state;
 
 
 static int sock_recv_loop(int sock, void *buffer, uint32_t size)
@@ -138,7 +112,7 @@ static int scc_send_msg_hello(int sock)
 	
 	const char *snapclient_hello =           \
 	"{"                                      \
-	"    \"Arch\": \"x86_64\","              \
+	"    \"Arch\": \"riscv\","              \
 	"    \"ClientName\": \"esp32client\","   \
 	"    \"HostName\": \"esp32client01\","   \
 	"    \"ID\": \"84:f7:03:39:f7:2c\","     \
@@ -146,7 +120,7 @@ static int scc_send_msg_hello(int sock)
 	"    \"MAC\": \"84:f7:03:39:f7:2c\","    \
 	"    \"OS\": \"esp32\","                 \
 	"    \"SnapStreamProtocolVersion\": 2,"  \
-	"    \"Version\": \"0.17.1\""            \
+	"    \"Version\": \"0.0.1\""             \
 	"}";
 
 	uint32_t len = strlen(snapclient_hello);
@@ -189,146 +163,55 @@ static int scc_recv_codec_header(ScClientState *state, const char *buffer, uint3
 	const uint32_t *data_size  = ((uint32_t *)(buffer + 4 + *codec_size));
 	const char     *data       = buffer + 8 + *codec_size;
 	ESP_LOGI(TAG, "codec header name=%.*s data_size=%i", *codec_size, codec_name, *data_size);
+	
+	// FIXME: This needs to check if the player was already created, and if so destroy and recreate
+	// it.
+	uint8_t codec = 0;
 	if (*codec_size == 3 && !strncmp(codec_name, "pcm", 3))
 	{
-		state->codec = SNAPCAST_CODEC_PCM;
-		if (*data_size != sizeof(RiffHdr))
-		{
-			ESP_LOGE(TAG, "PCM codec info unexpected size (got %i, expected %i)", *data_size, sizeof(RiffHdr));
-			return 1;
-		}
-		const RiffHdr *riff = (const RiffHdr *)data;
-		ESP_LOGI(TAG, "PCM info chunk='%.4s', format='%.4s', size=%i", &riff->chunk_id_4cc, &riff->format_4cc, riff->chunk_size);
-		ESP_LOGI(TAG, "PCM info subchunk='%.4s', size=%i", &riff->sub1_id_4cc, riff->sub1_size);
-		ESP_LOGI(TAG, "PCM info format=%i, channels=%i, sample=%i, byte_rate=%i, align=%i, bps=%i", riff->format, riff->num_channels, riff->sample_rate, riff->byte_rate, riff->block_align, riff->sample_bits);
-		ESP_LOGI(TAG, "PCM info subchunk='%.4s', size=%i", &riff->sub2_id_4cc, riff->sub2_size);
+		codec = PLAYER_CODEC_PCM;
 	}
 	else if (*codec_size == 4 && !strncmp(codec_name, "flac", 4))
 	{
-		state->codec = SNAPCAST_CODEC_FLAC;
-		state->flac_decoder = FLAC__stream_decoder_new();
-		if (!state->flac_decoder)
-		{
-			ESP_LOGE(TAG, "Failed to create FLAC decoder");
-			return 1;
-		}
-		// TODO
-		ESP_LOGE(TAG, "Server requested FLAC and that isn't working yet");
-		FLAC__stream_decoder_delete(state->flac_decoder);
-		return 1;
+		codec = PLAYER_CODEC_FLAC;
 	}
 	else if (*codec_size == 4 && !strncmp(codec_name, "opus", 4))
 	{
-		state->codec = SNAPCAST_CODEC_OPUS;
-		int error = OPUS_OK;
-		state->opus_decoder = opus_decoder_create(48000, 2, &error);
-		if (error != OPUS_OK)
-		{
-			state->opus_decoder = NULL;
-			ESP_LOGE(TAG, "Failed to create OPUS decoder: %i(%s)", error, opus_strerror(error));
-			return 1;
-		}
+		codec = PLAYER_CODEC_OPUS;
 	}
 	else
 	{
-		state->codec = SNAPCAST_CODEC_UNKNOWN;
 		ESP_LOGE(TAG, "unknown codec %.*s", *codec_size, codec_name);
 		return 1;
 	}
-	ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_set_clk(I2S_NUM, 48000, 16, 2));
+	if (app_player_init(codec, data, *data_size))
+	{
+		return 1;
+	}
+	app_player_set_params(state->buffer_ms, state->latency, state->muted, state->volume);
 	return 0;
 }
 
 static int scc_recv_wire_chunk(ScClientState *state, char **buffer, uint32_t size)
 {
 //	ESP_LOGI(TAG, "handling wire chunk message (size=%i)", size);
-	const ScPacketWireChunk *chunk = ((ScPacketWireChunk *)(*buffer));
+	ScPacketWireChunk *chunk = ((ScPacketWireChunk *)(*buffer));
 	if (size < sizeof(ScPacketWireChunk) || size < sizeof(ScPacketWireChunk) + chunk->size)
 	{
 		ESP_LOGE(TAG, "wire chunk content size (%i+%i) larger than message size (%i)", sizeof(ScPacketWireChunk), chunk->size, size);
 		return 1;
 	}
-	uint32_t t0=0, t1=0, t2=0;
-	int16_t *samples;
-	int16_t nsamples;
-	bool free_samples = false;
-	if (state->codec == SNAPCAST_CODEC_UNKNOWN)
+	
+	if (app_player_enqueue_chunk(chunk))
 	{
-		// TODO: snapcast spec says to just ignore if the server message hasn't come
-		return 0;
-	}
-	else if (state->codec == SNAPCAST_CODEC_PCM)
-	{
-		samples = ((int16_t *)(chunk->payload));
-		nsamples = chunk->size / 2;
-	}
-	else if (state->codec == SNAPCAST_CODEC_FLAC)
-	{
-		// TODO
-		return 0;
-	}
-	else if (state->codec == SNAPCAST_CODEC_OPUS)
-	{
-		assert(state->opus_decoder);
-		// TODO: Opus specs 120ms as the max frame, but snapcast can probably guarantee less than
-		// that.  For example, it's currently sending 20ms frames and probably never sending 120ms.
-		// TODO: Might want to statically allocate this, but if I get rid of the I2S driver with
-		// its overhead then this would just decode into my I2S DMA ring buffer and thus a static
-		// scratch buffer is more of a fallback solution (to avoid fragmentation and overhead)
-		// TODO: This is a little slow.  At COMPLEXITY:10 and 20MHz DIO flash and -O2, it takes about
-		// 30ms to decode a 40ms frame.  -O2/-Os don't make much difference, bumping the flash to
-		// 80MHz QIO helps massively, dropping decode time to ~12ms.  With the faster flash, -Os
-		// is about 10% slower than -O2.  Sprinkling some IRAM_ATTR didn't really help in the slow
-		// flash case, but I also didn't identify any hotspots, just tried 'randomly'.
-		int16_t max_frame = (120*48000/1000); // 120ms is max size
-		t0 = cpu_hal_get_cycle_count();
-		samples  = malloc(2*max_frame*sizeof(int16_t));
-		free_samples = true;
-		// TODO: some of the decoder options (OPUS_SET_GAIN_REQUEST) could be helpful
-		t1 = cpu_hal_get_cycle_count();
-		int r = opus_decode(state->opus_decoder, chunk->payload, chunk->size, samples, max_frame, 0);
-		t2 = cpu_hal_get_cycle_count();
-		if (r < 0)
-		{
-			free(samples);
-			ESP_LOGE(TAG, "Failed to decode OPUS data: %i(%s)", r, opus_strerror(r));
-			return 1;
-		}
-		nsamples = 4 * r;
+		// ESP_LOGE(TAG, "queue chunk (count = %i, free mem = %i)", uxQueueMessagesWaiting(state->chunk_queue), esp_get_free_heap_size());
+		*buffer = NULL;
 	}
 	else
 	{
-		ESP_LOGE(TAG, "Unsupported CODEC %i", state->codec);
-		return 1;
+		ESP_LOGE(TAG, "failed to buffer wire chunk");
 	}
 	
-	uint32_t t3 = cpu_hal_get_cycle_count();
-	int16_t min=0x7FFF, max=-0x8000;
-	for (int i = 0; i < nsamples / 2; i++)
-	{
-		int16_t *s = samples + i;
-		*s = ((int32_t)*s) * state->volume / 100 / 8 * (1 - state->muted);
-		if (*s < min) min = *s;
-		if (*s > max) max = *s;
-	}
-	uint32_t t4 = cpu_hal_get_cycle_count();
-	uint64_t xx = chunk->timestamp_sec * 1000000 + chunk->timestamp_usec;
-//	ESP_LOGI(TAG, "samples range = [%5i, %5i] length = %i, stime = %llims", min, max, nsamples/4, xx/1000);
-	
-	size_t written = 0;
-	uint32_t t5 = cpu_hal_get_cycle_count();
-	ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, samples, nsamples, &written, 100));
-	uint32_t t6 = cpu_hal_get_cycle_count();
-	if (written < nsamples)
-	{
-		ESP_LOGW(TAG, "wire chunk wrote %i of %i", written, nsamples);
-	}
-	ESP_LOGW(TAG, "Timing: malloc=%ius, decode=%ius, volume=%ius, i2s=%ius", (t1-t0)/160, (t2-t1)/160, (t4-t3)/160, (t6-t5)/160);
-	
-	if (free_samples)
-	{
-		free(samples);
-	}
 	return 0;
 }
 
@@ -373,6 +256,8 @@ static int scc_recv_server_settings(ScClientState *state, const char *buffer, ui
 	}
 	cJSON_Delete(json);
 	
+	app_player_set_params(state->buffer_ms, state->latency, state->muted, state->volume);
+	
 	return 0;
 }
 
@@ -399,16 +284,6 @@ void app_snapclient_task(void *pvParameters)
 	saddr.sin_family = AF_INET;
 	saddr.sin_port = htons(1704);
 	inet_aton(SERVER_IP, &saddr.sin_addr);
-	
-	ScClientState state = {
-		.codec = SNAPCAST_CODEC_UNKNOWN,
-		.buffer_ms = 0,
-		.latency = 0,
-		.muted = 1,
-		.volume = 100,
-		.opus_decoder = NULL,
-		.flac_decoder = NULL,
-	};
 	
 	int sock;
 	int r;
@@ -477,16 +352,16 @@ void app_snapclient_task(void *pvParameters)
 			
 			switch (hdr.type) {
 				case SNAPCAST_MESSAGE_TYPE_CODEC_HEADER:
-					failed = scc_recv_codec_header(&state, body, hdr.size);
+					failed = scc_recv_codec_header(&s_state, body, hdr.size);
 					break;
 				case SNAPCAST_MESSAGE_TYPE_WIRE_CHUNK:
-					failed = scc_recv_wire_chunk(&state, &body, hdr.size);
+					failed = scc_recv_wire_chunk(&s_state, &body, hdr.size);
 					break;
 				case SNAPCAST_MESSAGE_TYPE_SERVER_SETTINGS:
-					failed = scc_recv_server_settings(&state, body, hdr.size);
+					failed = scc_recv_server_settings(&s_state, body, hdr.size);
 					break;
 				case SNAPCAST_MESSAGE_TYPE_STREAM_TAGS:
-					failed = scc_recv_stream_tags(&state, body, hdr.size);
+					failed = scc_recv_stream_tags(&s_state, body, hdr.size);
 					break;
 				case SNAPCAST_MESSAGE_TYPE_BASE:
 				case SNAPCAST_MESSAGE_TYPE_TIME:
@@ -504,7 +379,19 @@ void app_snapclient_task(void *pvParameters)
 			free(body);
 		}
 		
+		// TODO: reset the player here.  In particular, free+clear the chunk queue since half the
+		// time this dies is due to OOM in the wifi, so it won't recover unless some is freed.
 		ESP_LOGE(TAG, "DIED");
 	}
 }
 
+void app_snapclient_init(void)
+{
+	s_state.buffer_ms = 1000;
+	s_state.latency   = 0;
+	s_state.muted     = 1;
+	s_state.volume    = 100;
+	
+	xTaskCreate(&app_snapclient_task, "snapclient_task", 1024*3, NULL, 5, NULL);
+	ESP_LOGW(TAG, "with app_snapclient_task driver free mem %d", esp_get_free_heap_size());
+}
