@@ -184,6 +184,7 @@ void app_player_manager(void *pvParameters)
 {
 	i2s_event_t event;
 	uint32_t tx_pending = 0;
+	uint32_t print_period = 0;
 	
 	// The I2S device seems to be set up with all DMA buffers considered full of zeros.  So init
 	// the pending count as "full" so that this can better estimate the DMA queue latency and more
@@ -192,6 +193,7 @@ void app_player_manager(void *pvParameters)
 	
 	while(1)
 	{
+		print_period++;
 		for (uint32_t ri2sq = xQueueReceive(s_player_ctrl.i2s_event_queue, &event, (200 / portTICK_PERIOD_MS));
 			ri2sq == pdPASS ;
 			ri2sq = xQueueReceive(s_player_ctrl.i2s_event_queue, &event, 0))
@@ -222,7 +224,7 @@ void app_player_manager(void *pvParameters)
 		// captured at the I2S interrupt if I rewrite the i2s driver like I want to.
 		uint64_t now = scc_time_get_us();
 		
-		if (!s_player_ctrl.sync_status)
+		if (!s_player_ctrl.sync_status && print_period % 16 == 0)
 		{
 			ESP_LOGI(TAG, "time sync pending");
 		}
