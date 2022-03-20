@@ -29,13 +29,15 @@ struct TimeModel;
 void app_wifi_init_sta(void);
 
 // player.c
+struct PlayerState;
 #define PLAYER_CODEC_PCM                       0
 #define PLAYER_CODEC_FLAC                      1
 #define PLAYER_CODEC_OPUS                      2
-void app_player_set_params(uint32_t buffer_ms, uint32_t latency_ms, uint8_t muted, uint8_t volume);
-void app_player_set_time_model(const struct TimeModel *model);
-int app_player_enqueue_chunk(struct ScPacketWireChunk *chunk);
-int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_sizes);
+void app_player_set_params(struct PlayerState *state, uint32_t buffer_ms, uint32_t latency_ms, uint8_t muted, uint8_t volume);
+void app_player_set_time_model(struct PlayerState *state, const struct TimeModel *model);
+int app_player_enqueue_chunk(struct PlayerState *state, struct ScPacketWireChunk *chunk);
+struct PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t codec_info_sizes);
+void app_player_destroy(struct PlayerState *state);
 
 // snapclient.c
 void app_snapclient_init(void);

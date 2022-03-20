@@ -57,6 +57,8 @@ typedef struct ScClientState
 {
 	TimeModelState time_state;
 	
+	struct PlayerState *player;
+	
 	// Server settings fields
 	uint32_t buffer_ms;
 	uint32_t latency;
@@ -198,7 +200,7 @@ static int scc_recv_hdr(int sock, ScPacketHdr *hdr)
 		uint64_t clock = app_read_systimer_unit1();
 		if (xtime_add_observation(&s_state.time_state, time, clock))
 		{
-			app_player_set_time_model(&s_state.time_state.model);
+			app_player_set_time_model(s_state.player, &s_state.time_state.model);
 		}
 #ifdef TIME_DBG_SAMPLES
 		if (s_time_dbg_count < TIME_DBG_SAMPLES)
@@ -243,11 +245,23 @@ static int scc_recv_codec_header(ScClientState *state, const char *buffer, uint3
 		ESP_LOGE(TAG, "unknown codec %.*s", *codec_size, codec_name);
 		return 1;
 	}
-	if (app_player_init(codec, data, *data_size))
+	
+	if (s_state.player)
+	{
+		app_player_destroy(s_state.player);
+	}
+	
+	s_state.player = app_player_create(codec, data, *data_size);
+	if (!s_state.player)
 	{
 		return 1;
 	}
-	app_player_set_params(state->buffer_ms, state->latency, state->muted, state->volume);
+	if (s_state.time_state.sync_status)
+	{
+		app_player_set_time_model(s_state.player, &s_state.time_state.model);
+	}
+	app_player_set_params(s_state.player, state->buffer_ms, state->latency, state->muted, state->volume);
+	
 	return 0;
 }
 
@@ -261,14 +275,17 @@ static int scc_recv_wire_chunk(ScClientState *state, char **buffer, uint32_t siz
 		return 1;
 	}
 	
-	if (app_player_enqueue_chunk(chunk))
+	if (s_state.player)
 	{
-		// ESP_LOGE(TAG, "queue chunk (count = %i, free mem = %i)", uxQueueMessagesWaiting(state->chunk_queue), esp_get_free_heap_size());
-		*buffer = NULL;
-	}
-	else
-	{
-		ESP_LOGE(TAG, "failed to buffer wire chunk");
+		if (app_player_enqueue_chunk(s_state.player, chunk))
+		{
+			// ESP_LOGE(TAG, "queue chunk (count = %i, free mem = %i)", uxQueueMessagesWaiting(state->chunk_queue), esp_get_free_heap_size());
+			*buffer = NULL;
+		}
+		else
+		{
+			ESP_LOGE(TAG, "failed to buffer wire chunk");
+		}
 	}
 	
 	return 0;
@@ -315,7 +332,10 @@ static int scc_recv_server_settings(ScClientState *state, const char *buffer, ui
 	}
 	cJSON_Delete(json);
 	
-	app_player_set_params(state->buffer_ms, state->latency, state->muted, state->volume);
+	if (s_state.player)
+	{
+		app_player_set_params(s_state.player, state->buffer_ms, state->latency, state->muted, state->volume);
+	}
 	
 	return 0;
 }
@@ -440,7 +460,12 @@ void app_snapclient_task(void *pvParameters)
 		
 		// TODO: reset the player here.  In particular, free+clear the chunk queue since half the
 		// time this dies is due to OOM in the wifi, so it won't recover unless some is freed.
-		ESP_LOGE(TAG, "DIED");
+		if (s_state.player)
+		{
+			app_player_destroy(s_state.player);
+			s_state.player = NULL;
+		}
+		ESP_LOGE(TAG, "DIED (mem=%i)", esp_get_free_heap_size());
 	}
 }
 
@@ -449,6 +474,8 @@ void app_snapclient_init(void)
 	s_state.time_state.sync_status = 0;
 	s_state.time_state.n_samples_filt = 0;
 	s_state.time_state.n_samples_raw = 0;
+	
+	s_state.player = NULL;
 	
 	s_state.buffer_ms = 1000;
 	s_state.latency   = 0;

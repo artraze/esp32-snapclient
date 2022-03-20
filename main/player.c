@@ -53,6 +53,12 @@ static const char *TAG = "app_player";
 #error DMA needs more buffers
 #endif
 
+// The task notification index to use to notify for exit.  Note that FreeRTOS stream and message
+// buffers use #0, but esp32 only configures the one slot so use #0 and just avoid stream/msg
+// buffers.
+#define MANAGER_TASK_NOTIFY_IDX_EXIT                 0
+
+
 typedef struct __attribute__((packed)) ScPacketWireChunk
 {
 	int32_t timestamp_sec;   // The second value of the timestamp when this part of the stream was recorded
@@ -79,8 +85,11 @@ typedef struct RiffHdr
 	uint8_t data[0];
 } RiffHdr;
 
-typedef struct PlayerCtrl
+typedef struct PlayerState
 {
+	TaskHandle_t manager_task;
+	SemaphoreHandle_t exit_notify;
+	
 	QueueHandle_t i2s_event_queue;
 	
 	QueueHandle_t chunk_queue;
@@ -97,24 +106,20 @@ typedef struct PlayerCtrl
 	
 	OpusDecoder *opus_decoder;
 	FLAC__StreamDecoder *flac_decoder;
-	
-} PlayerCtrl;
-
-static uint32_t s_exists = 0;
-static PlayerCtrl s_player_ctrl;
+} PlayerState;
 
 static uint8_t s_zero_samples[4 * PLAYER_DMA_BUF_ZEROS_SAMPLES];
 static int16_t s_decode_samples[2 * PLAYER_MAX_FRAME_SAMPLES];
 
-static uint64_t scc_time_get_us()
+static uint64_t scc_time_get_us(const PlayerState *state)
 {
-	xSemaphoreTake(s_player_ctrl.time_mutex, portMAX_DELAY);
-	uint64_t time = xtime_calc(&s_player_ctrl.time_model, app_read_systimer_unit1());
-	xSemaphoreGive(s_player_ctrl.time_mutex);
+	xSemaphoreTake(state->time_mutex, portMAX_DELAY);
+	uint64_t time = xtime_calc(&state->time_model, app_read_systimer_unit1());
+	xSemaphoreGive(state->time_mutex);
 	return time;
 }
 
-static void app_player_fill_zeros(uint32_t samples)
+static void app_player_fill_zeros(const PlayerState *state, uint32_t samples)
 {
 	uint32_t t0 = app_read_systimer_unit1()/16000;
 	while (samples)
@@ -133,27 +138,27 @@ static void app_player_fill_zeros(uint32_t samples)
 	}
 }
 
-void app_player_set_params(uint32_t buffer_ms, uint32_t latency_ms, uint8_t muted, uint8_t volume)
+void app_player_set_params(PlayerState *state, uint32_t buffer_ms, uint32_t latency_ms, uint8_t muted, uint8_t volume)
 {
-	s_player_ctrl.buffer_ms = buffer_ms;
-	s_player_ctrl.latency_ms = latency_ms;
-	s_player_ctrl.muted = muted;
-	s_player_ctrl.volume = volume;
+	state->buffer_ms = buffer_ms;
+	state->latency_ms = latency_ms;
+	state->muted = muted;
+	state->volume = volume;
 }
 
-void app_player_set_time_model(const TimeModel *model)
+void app_player_set_time_model(PlayerState *state, const TimeModel *model)
 {
-	if (!s_player_ctrl.sync_status)
+	if (!state->sync_status)
 	{
 		ESP_LOGI(TAG, "got initial time sync");
 	}
-	xSemaphoreTake(s_player_ctrl.time_mutex, portMAX_DELAY);
-	memcpy(&s_player_ctrl.time_model, model, sizeof(TimeModel));
-	s_player_ctrl.sync_status = 1;
-	xSemaphoreGive(s_player_ctrl.time_mutex);
+	xSemaphoreTake(state->time_mutex, portMAX_DELAY);
+	memcpy(&state->time_model, model, sizeof(TimeModel));
+	state->sync_status = 1;
+	xSemaphoreGive(state->time_mutex);
 }
 
-int app_player_enqueue_chunk(ScPacketWireChunk *chunk)
+int app_player_enqueue_chunk(PlayerState *state, ScPacketWireChunk *chunk)
 {
 	// FIXME: Once this isn't using a global, this check can be removed.
 	// FIXME: This should probably monitor free memory and drop chunks to prevent OOM, though
@@ -162,16 +167,16 @@ int app_player_enqueue_chunk(ScPacketWireChunk *chunk)
 	// gives up on sync).  Still, if the player gets behind (e.g. no time sync) this could be
 	// helpful since the static queue size needs to be large enough for small chunks but the server
 	// could send big ones.s
-	if (!s_player_ctrl.chunk_queue)
+	if (!state->chunk_queue)
 	{
 		return 0;
 	}
-	BaseType_t rsend = xQueueSend(s_player_ctrl.chunk_queue, &chunk, 0);
+	BaseType_t rsend = xQueueSend(state->chunk_queue, &chunk, 0);
 	if (rsend == errQUEUE_FULL)
 	{
 		ScPacketWireChunk *old;
-		BaseType_t rrecv = xQueueReceive(s_player_ctrl.chunk_queue, &old, 0);
-		rsend = xQueueSend(s_player_ctrl.chunk_queue, &chunk, 0);
+		BaseType_t rrecv = xQueueReceive(state->chunk_queue, &old, 0);
+		rsend = xQueueSend(state->chunk_queue, &chunk, 0);
 		if (rrecv == pdTRUE)
 		{
 			free(old);
@@ -183,7 +188,7 @@ int app_player_enqueue_chunk(ScPacketWireChunk *chunk)
 	{
 		ESP_LOGW(TAG, "memory low (%i), discarding chunk", esp_get_free_heap_size());
 		ScPacketWireChunk *old;
-		if (xQueueReceive(s_player_ctrl.chunk_queue, &old, 0) != pdPASS)
+		if (xQueueReceive(state->chunk_queue, &old, 0) != pdPASS)
 		{
 			ESP_LOGW(TAG, "memory low complete");
 			break;
@@ -195,9 +200,12 @@ int app_player_enqueue_chunk(ScPacketWireChunk *chunk)
 
 void app_player_manager(void *pvParameters)
 {
+	PlayerState *state = (PlayerState *)pvParameters;
 	i2s_event_t event;
 	uint32_t tx_pending = 0;
 	uint32_t print_period = 0;
+	
+	xTaskNotifyStateClearIndexed(NULL, MANAGER_TASK_NOTIFY_IDX_EXIT);
 	
 	// The I2S device seems to be set up with all DMA buffers considered full of zeros.  So init
 	// the pending count as "full" so that this can better estimate the DMA queue latency and more
@@ -207,9 +215,17 @@ void app_player_manager(void *pvParameters)
 	while(1)
 	{
 		print_period++;
-		for (uint32_t ri2sq = xQueueReceive(s_player_ctrl.i2s_event_queue, &event, (200 / portTICK_PERIOD_MS));
+		
+		uint32_t exit = ulTaskNotifyTakeIndexed(MANAGER_TASK_NOTIFY_IDX_EXIT, pdTRUE, 0);
+		if (exit)
+		{
+			ESP_LOGI(TAG, "app_player_manager - got exit signal");
+			break;
+		}
+		
+		for (uint32_t ri2sq = xQueueReceive(state->i2s_event_queue, &event, (50 / portTICK_PERIOD_MS));
 			ri2sq == pdPASS ;
-			ri2sq = xQueueReceive(s_player_ctrl.i2s_event_queue, &event, 0))
+			ri2sq = xQueueReceive(state->i2s_event_queue, &event, 0))
 		{
 			if (event.type == I2S_EVENT_TX_DONE)
 			{
@@ -228,30 +244,29 @@ void app_player_manager(void *pvParameters)
 				}
 			}
 		}
-		
 		// TODO: This `now` is probably pretty sketchy since this needs to wakeup after the ISR and
 		// read the queue.  Hopefully that's a fairly small and reasonably deterministic delay but
 		// isn't ideal.  It's fine for now as this isn't compensating for round trip time, but if
 		// that gets to be something it supports, it needs a better time source.  That probably
 		// means calculating the sysclk value based on number of samples sent, but maybe it could be
 		// captured at the I2S interrupt if I rewrite the i2s driver like I want to.
-		uint64_t now = scc_time_get_us();
+		uint64_t now = scc_time_get_us(state);
 		
-		if (!s_player_ctrl.sync_status && print_period % 16 == 0)
+		if (!state->sync_status && print_period % 16 == 0)
 		{
 			ESP_LOGI(TAG, "time sync pending");
 		}
 		
-		// ESP_LOGE(TAG, "queue chunk (count = %i, free mem = %i)", uxQueueMessagesWaiting(s_player_ctrl.chunk_queue), esp_get_free_heap_size());
+		// ESP_LOGE(TAG, "queue chunk (count = %i, free mem = %i)", uxQueueMessagesWaiting(state->chunk_queue), esp_get_free_heap_size());
 		for (ScPacketWireChunk *chunk;
-				s_player_ctrl.sync_status &&
+				state->sync_status &&
 				tx_pending < PLAYER_PLAYBACK_BUF_SAMPLES_MIN &&
-				xQueueReceive(s_player_ctrl.chunk_queue, &chunk, 0) == pdTRUE;
+				xQueueReceive(state->chunk_queue, &chunk, 0) == pdTRUE;
 			 free(chunk))
 		{
-			//ESP_LOGE(TAG, "wire chunk buffer reading len = %i", s_player_ctrl.chunk_buf_count);
+			//ESP_LOGE(TAG, "wire chunk buffer reading len = %i", state->chunk_buf_count);
 			int64_t  play_time     = TV_2_US(chunk->timestamp);
-			int64_t  play_offset  = (s_player_ctrl.buffer_ms - s_player_ctrl.latency_ms) * 1000LL + play_time - now;
+			int64_t  play_offset  = (state->buffer_ms - state->latency_ms) * 1000LL + play_time - now;
 			int64_t  sample_offset = play_offset * 48000 / 1000000;
 			int16_t *samples = NULL;
 			uint32_t nsamples = 0;
@@ -261,15 +276,15 @@ void app_player_manager(void *pvParameters)
 				// In theory there could be useful samples at the end of the chunk even if the start
 				// is negative, but the buffer is underrunning so better to try and start fresh than
 				// salvage the tail of a chunk.
-				ESP_LOGW(TAG, "discarded a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, s_player_ctrl.buffer_ms, s_player_ctrl.latency_ms);
+				ESP_LOGW(TAG, "discarded a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, state->buffer_ms, state->latency_ms);
 				continue;
 			}
-			if (sample_offset > PLAYER_PLAYBACK_BUF_SAMPLES_MIN)
+			if (sample_offset > PLAYER_PLAYBACK_BUF_SAMPLES_MIN + PLAYER_PLAYBACK_SAMPLE_JITTER_MIN)
 			{
 				// This means that the chunk is scheduled to be played further in the future than
 				// we buffer for I2S.  So if shouldn't be played now and instead deferred.  The
 				// DMA buffer will be filled with zeros as needed.
-				if (xQueueSendToFront(s_player_ctrl.chunk_queue, &chunk, 0) != pdTRUE)
+				if (xQueueSendToFront(state->chunk_queue, &chunk, 0) != pdTRUE)
 				{
 					// The buffer is full but the front chunk is still in the future.  That probably
 					// means the number of chunks needed to be buffered `buffer_ms/chunk_ms` is
@@ -277,17 +292,17 @@ void app_player_manager(void *pvParameters)
 					ESP_LOGE(TAG, "discarded a future chunk due to full buffer?!");
 					free(chunk);
 				}
-				ESP_LOGI(TAG, "replaced future buf @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, s_player_ctrl.buffer_ms, s_player_ctrl.latency_ms);
+				ESP_LOGI(TAG, "replaced future buf @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, state->buffer_ms, state->latency_ms);
 				break;
 			}
 			if (tx_pending + PLAYER_PLAYBACK_SAMPLE_JITTER_MIN < sample_offset)
 			{
 				ESP_LOGI(TAG, "padding for chunk play (tx_pending=%i, sample_offset=%i", tx_pending, sample_offset);
-				app_player_fill_zeros(sample_offset - tx_pending);
+				app_player_fill_zeros(state, sample_offset - tx_pending);
 				tx_pending = sample_offset;
 			}
 			//ESP_LOGI(TAG, "playing a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli)", sample_offset, play_offset, play_time, now);
-			if (s_player_ctrl.codec == PLAYER_CODEC_PCM)
+			if (state->codec == PLAYER_CODEC_PCM)
 			{
 				// PCM is pretty tight.  For best results the chunk_ms on the server should be 20ms
 				// as larger seems to hit heap fragmentation issues.  buffer_ms needs to be ~400ms
@@ -295,9 +310,9 @@ void app_player_manager(void *pvParameters)
 				nsamples = chunk->size / 4;
 				samples  = chunk->payload;
  			}
-			else if (s_player_ctrl.codec == PLAYER_CODEC_OPUS)
+			else if (state->codec == PLAYER_CODEC_OPUS)
 			{
-				assert(s_player_ctrl.opus_decoder);
+				assert(state->opus_decoder);
 				// TODO: Opus specs 120ms as the max frame, but snapcast can probably guarantee less than
 				// that.  For example, it's currently sending 20ms frames and probably never sending 120ms.
 				// TODO: Might want to statically allocate this, but if I get rid of the I2S driver with
@@ -310,7 +325,7 @@ void app_player_manager(void *pvParameters)
 				// flash case, but I also didn't identify any hotspots, just tried 'randomly'.
 				int16_t max_frame = PLAYER_MAX_FRAME_SAMPLES;
 				// TODO: some of the decoder options (OPUS_SET_GAIN_REQUEST) could be helpful
-				int r = opus_decode(s_player_ctrl.opus_decoder, chunk->payload, chunk->size, s_decode_samples, max_frame, 0);
+				int r = opus_decode(state->opus_decoder, chunk->payload, chunk->size, s_decode_samples, max_frame, 0);
 				if (r < 0)
 				{
 					ESP_LOGE(TAG, "Failed to decode OPUS data: %i(%s)", r, opus_strerror(r));
@@ -321,14 +336,14 @@ void app_player_manager(void *pvParameters)
 			}
 			else
 			{
-				ESP_LOGE(TAG, "Unsupported CODEC %i", s_player_ctrl.codec);
+				ESP_LOGE(TAG, "Unsupported CODEC %i", state->codec);
 				continue;
 			}
 			int16_t min=0x7FFF, max=-0x8000;
 			for (int i = 0; i < 2 * nsamples; i++)
 			{
 				int16_t *s = samples + i;
-				*s = ((int32_t)*s) * s_player_ctrl.volume / 100 / 8 * (1 - s_player_ctrl.muted);
+				*s = ((int32_t)*s) * state->volume / 100 / 8 * (1 - state->muted);
 				if (*s < min) min = *s;
 				if (*s > max) max = *s;
 			}
@@ -340,36 +355,34 @@ void app_player_manager(void *pvParameters)
 		if (tx_pending < PLAYER_PLAYBACK_BUF_SAMPLES_MIN)
 		{
 			//ESP_LOGW(TAG, "filling zeros");
-			app_player_fill_zeros(PLAYER_PLAYBACK_BUF_SAMPLES_MIN - tx_pending);
+			app_player_fill_zeros(state, PLAYER_PLAYBACK_BUF_SAMPLES_MIN - tx_pending);
 			tx_pending = PLAYER_PLAYBACK_BUF_SAMPLES_MIN;
 		}
 	}
+	xSemaphoreGive(state->exit_notify);
+	ESP_LOGI(TAG, "app_player_manager - self destruct");
+	vTaskDelete(NULL);
 }
 
-int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_sizes)
+PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t codec_info_sizes)
 {
-	if (s_exists)
-	{
-		ScPacketWireChunk *old;
-		while (xQueueReceive(s_player_ctrl.chunk_queue, &old, 0) == pdPASS)
-		{
-			free(old);
-		}
-	}
-	
-	s_exists = 1;
+	// While it may be overkill to need to create/destroy this when the codec changes, there isn't
+	// a whole lot to be saved by trying to recycle any of this state.  The I2S code will lose
+	// track of how many samples are queued, the opus codec is stateful and needs to be recreated
+	// and so on.
 	
 	// Should be in BSS and be zeroed, but just to be sure...
 	bzero(s_zero_samples, 4 * PLAYER_DMA_BUF_ZEROS_SAMPLES);
 	
-	s_player_ctrl.sync_status = 0;
-	s_player_ctrl.codec = codec;
-	s_player_ctrl.buffer_ms = 0;
-	s_player_ctrl.latency_ms = 0;
-	s_player_ctrl.muted = 1;
-	s_player_ctrl.volume = 100;
-	s_player_ctrl.opus_decoder = NULL;
-	s_player_ctrl.flac_decoder = NULL;
+	PlayerState *state = malloc(sizeof(PlayerState));
+	bzero(state, sizeof(PlayerState));
+	
+	state->exit_notify = xSemaphoreCreateBinary();
+	state->time_mutex = xSemaphoreCreateMutex();
+	state->chunk_queue = xQueueCreate(PLAYER_CHUNK_BUF_LEN, sizeof(ScPacketWireChunk*));
+	state->sync_status = 0;
+	state->muted = 1;
+	state->codec = codec;
 	
 	// TODO: use the correct sample rate, channels, etc from the codec info
 	switch (codec)
@@ -379,7 +392,7 @@ int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_s
 			if (codec_info_sizes != sizeof(RiffHdr))
 			{
 				ESP_LOGE(TAG, "PCM codec info unexpected size (got %i, expected %i)", codec_info_sizes, sizeof(RiffHdr));
-				return 1;
+				goto exit;
 			}
 			const RiffHdr *riff = (const RiffHdr *)codec_info;
 			ESP_LOGI(TAG, "PCM info chunk='%.4s', format='%.4s', size=%i", &riff->chunk_id_4cc, &riff->format_4cc, riff->chunk_size);
@@ -390,37 +403,33 @@ int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_s
 		}
 		case PLAYER_CODEC_FLAC:
 		{
-			s_player_ctrl.flac_decoder = FLAC__stream_decoder_new();
-			if (!s_player_ctrl.flac_decoder)
+			state->flac_decoder = FLAC__stream_decoder_new();
+			if (!state->flac_decoder)
 			{
 				ESP_LOGE(TAG, "Failed to create FLAC decoder");
-				return 1;
+				goto exit;
 			}
 			// TODO
 			ESP_LOGE(TAG, "Server requested FLAC and that isn't working yet");
-			FLAC__stream_decoder_delete(s_player_ctrl.flac_decoder);
-			return 1;
+			FLAC__stream_decoder_delete(state->flac_decoder);
+			goto exit;
 		}
 		case PLAYER_CODEC_OPUS:
 		{
 			int error = OPUS_OK;
-			s_player_ctrl.opus_decoder = opus_decoder_create(48000, 2, &error);
+			state->opus_decoder = opus_decoder_create(48000, 2, &error);
 			if (error != OPUS_OK)
 			{
-				s_player_ctrl.opus_decoder = NULL;
+				state->opus_decoder = NULL;
 				ESP_LOGE(TAG, "Failed to create OPUS decoder: %i(%s)", error, opus_strerror(error));
-				return 1;
+				goto exit;
 			}
 			break;
 		}
 		default:
 			ESP_LOGE(TAG, "unknown codec %i", codec);
-			return 1;
+			goto exit;
 	}
-	
-	s_player_ctrl.time_mutex = xSemaphoreCreateMutex();
-	
-	s_player_ctrl.chunk_queue = xQueueCreate(PLAYER_CHUNK_BUF_LEN, sizeof(ScPacketWireChunk*));
 	
 	ESP_LOGW(TAG, "initial free mem %d", esp_get_free_heap_size());
 	i2s_config_t i2s_config = {
@@ -443,18 +452,56 @@ int app_player_init(uint8_t codec, const void *codec_info, uint32_t codec_info_s
 		.data_out_num = GPIO_PIN_I2S_DOUT,
 		.data_in_num = I2S_PIN_NO_CHANGE
 	};
-	i2s_driver_install(I2S_NUM, &i2s_config, 16, &s_player_ctrl.i2s_event_queue);
+	i2s_driver_install(I2S_NUM, &i2s_config, 16, &state->i2s_event_queue);
 	i2s_set_pin(I2S_NUM, &pin_config);
 	
 	ESP_LOGW(TAG, "with i2s driver free mem %d", esp_get_free_heap_size());
 	
 	// Task for signal on I2S DMA complete
-	xTaskCreate(&app_player_manager, "player_manager", 1024*16, NULL, 1, NULL); 
+	xTaskCreate(&app_player_manager, "player_manager", 1024*16, (void *)state, 5, &state->manager_task);
 	ESP_LOGW(TAG, "with player_manager driver free mem %d", esp_get_free_heap_size());
 	
 	ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_set_clk(I2S_NUM, 48000, 16, 2));
 	
-	return 0;
+	return state;
+exit:
+	app_player_destroy(state);
+	return NULL;
 }
 
+void app_player_destroy(PlayerState *state)
+{
+	if (state->manager_task)
+	{
+		ESP_LOGI(TAG, "app_player_destroy - notify");
+		xTaskNotifyIndexed(state->manager_task, MANAGER_TASK_NOTIFY_IDX_EXIT, 1, eSetValueWithOverwrite);
+		ESP_LOGI(TAG, "app_player_destroy - wait");
+		xSemaphoreTake(state->exit_notify, portMAX_DELAY);
+		ESP_LOGI(TAG, "app_player_destroy - done");
+	}
+	if (state->chunk_queue)
+	{
+		ScPacketWireChunk *old;
+		while (xQueueReceive(state->chunk_queue, &old, 0) == pdPASS)
+		{
+			free(old);
+		}
+		vSemaphoreDelete(state->exit_notify);
+		vSemaphoreDelete(state->time_mutex);
+		vQueueDelete(state->chunk_queue);
+	}
+	if (state->flac_decoder)
+	{
+		FLAC__stream_decoder_delete(state->flac_decoder);
+	}
+	if (state->opus_decoder)
+	{
+		opus_decoder_destroy(state->opus_decoder);
+	}
+	if (state->i2s_event_queue)
+	{
+		i2s_driver_uninstall(I2S_NUM);
+	}
+	free(state);
+}
 
