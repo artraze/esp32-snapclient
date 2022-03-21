@@ -458,7 +458,7 @@ PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t c
 	ESP_LOGW(TAG, "with i2s driver free mem %d", esp_get_free_heap_size());
 	
 	// Task for signal on I2S DMA complete
-	xTaskCreate(&app_player_manager, "player_manager", 1024*16, (void *)state, 5, &state->manager_task);
+	xTaskCreate(&app_player_manager, "player_manager", 1024*16, (void *)state, APP_PRIO_PLAYER, &state->manager_task);
 	ESP_LOGW(TAG, "with player_manager driver free mem %d", esp_get_free_heap_size());
 	
 	ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_set_clk(I2S_NUM, 48000, 16, 2));

@@ -13,6 +13,10 @@
 #define GPIO_PIN_I2S_LRCK    1
 #define GPIO_PIN_I2S_DOUT    10
 
+// Highest system priority seems to be 18 (tcp).  Lowest is ~2 (console, tmrsvc)
+#define APP_PRIO_PLAYER      10
+#define APP_PRIO_CLIENT      5
+
 // This enables some hacky code that sends log output to UART0 even if the console is configured
 // to use the USB_JTAG output.  Helpful for debugging if something doesn't work without the USB
 // connected.

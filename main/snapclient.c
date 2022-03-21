@@ -482,6 +482,6 @@ void app_snapclient_init(void)
 	s_state.muted     = 1;
 	s_state.volume    = 100;
 	
-	xTaskCreate(&app_snapclient_task, "snapclient_task", 1024*3, NULL, 5, NULL);
+	xTaskCreate(&app_snapclient_task, "snapclient_task", 1024*3, NULL, APP_PRIO_CLIENT, NULL);
 	ESP_LOGW(TAG, "with app_snapclient_task driver free mem %d", esp_get_free_heap_size());
 }
