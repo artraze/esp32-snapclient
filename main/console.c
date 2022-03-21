@@ -1,4 +1,6 @@
 #include "main.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_console.h"
@@ -17,7 +19,39 @@ int app_console_set_name(int argc, char **argv)
 	printf("app_console_set_name %i %s\n", argc, argv[0]);
 	return 0;
 }
- 
+
+int app_console_dump_tasks(int argc, char **argv)
+{
+	TaskStatus_t *tasks_info;
+	UBaseType_t n_tasks;
+	uint32_t total_runtime;
+	
+	n_tasks = uxTaskGetNumberOfTasks();
+	
+	tasks_info = malloc(n_tasks * sizeof(TaskStatus_t));
+	assert(tasks_info);
+
+	n_tasks = uxTaskGetSystemState(tasks_info, n_tasks, &total_runtime);
+	if (total_runtime == 0) total_runtime = -1;
+	
+	printf("Num  Name                     Priority PriBase  RunTime     Run%%  StackMin\n");
+	for (int i = 0; i < n_tasks; i++)
+	{
+		TaskStatus_t *task = tasks_info + i;
+		printf("%4i %24s %8i %8i %11i %4i%% %11i\n",
+			task->xTaskNumber,
+			task->pcTaskName,
+			task->uxCurrentPriority,
+			task->uxBasePriority,
+			task->ulRunTimeCounter,
+			task->ulRunTimeCounter / (total_runtime / 100),
+			task->usStackHighWaterMark
+		);
+	}
+	free(tasks_info);
+	return 0;
+}
+
 void app_console_init(void)
 {
 	esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -42,14 +76,22 @@ void app_console_init(void)
 #endif
 #endif
 	
-	esp_console_cmd_t repl_cmd = {
+	esp_console_cmd_t repl_cmd1 = {
 		.command = "set_name",
 		.help = "Sets the device name (in nvs)",
 		.hint = "<name>",
 		.func = app_console_set_name,
 		.argtable = NULL,
 	};
-	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&repl_cmd));
+	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&repl_cmd1));
+	esp_console_cmd_t repl_cmd2 = {
+		.command = "tasks",
+		.help = "Dumps stats on FreeRTOS tasks",
+		.hint = "",
+		.func = app_console_dump_tasks,
+		.argtable = NULL,
+	};
+	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&repl_cmd2));
 }
 
 void app_console_start(void)
