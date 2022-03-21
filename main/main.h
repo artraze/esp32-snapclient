@@ -13,6 +13,11 @@
 #define GPIO_PIN_I2S_LRCK    1
 #define GPIO_PIN_I2S_DOUT    10
 
+// This enables some hacky code that sends log output to UART0 even if the console is configured
+// to use the USB_JTAG output.  Helpful for debugging if something doesn't work without the USB
+// connected.
+// #define REDIRECT_CONSOLE_UART
+
 // This is handy for configuration of the device, but sadly the USB_JTAG implementation is fairly
 // buggy.  In particular, vfs_dev_usb_serial_jtag doesn't correctly support O_NONBLOCK so once
 // the esp_console starts and switches to "driver" based usb_jtag it becomes permanently blocking.
