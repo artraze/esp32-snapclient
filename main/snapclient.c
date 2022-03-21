@@ -126,31 +126,51 @@ static int scc_send_hdr(int sock, uint16_t type, uint32_t size)
 static int scc_send_msg_hello(int sock)
 {
 	uint8_t mac[6];
+	char mac_str[6*3];
 	esp_read_mac(mac, ESP_MAC_WIFI_STA);
-	printf("mac:" MACSTR "\n", MAC2STR(mac));
+	sprintf(mac_str, MACSTR, MAC2STR(mac));
 	
-	const char *snapclient_hello =           \
-	"{"                                      \
-	"    \"Arch\": \"riscv\","              \
-	"    \"ClientName\": \"esp32client\","   \
-	"    \"HostName\": \"esp32client01\","   \
-	"    \"ID\": \"84:f7:03:39:f7:2c\","     \
-	"    \"Instance\": 1,"                   \
-	"    \"MAC\": \"84:f7:03:39:f7:2c\","    \
-	"    \"OS\": \"esp32\","                 \
-	"    \"SnapStreamProtocolVersion\": 2,"  \
-	"    \"Version\": \"0.0.1\""             \
+	char *hostname = util_read_nvs_str(APP_NVS_KEY_HOST_NAME, CONFIG_LWIP_LOCAL_HOSTNAME);
+	
+	// ID         - meant to be a unique id, which is a config setting that defaults to MAC, or some other unique id (if the platform doesn't give a useful MAC
+	// Instance   - ??? a config setting, probably to allow copies with the same ID
+	// ClientName - Name of this software.  "Snapclient" for the default app
+	// Version    - Version of this software.  `VERSION` macro for the default app
+	const char *message_fmt =                       \
+	"{\n"                                           \
+	"    \"Arch\": \"riscv\",\n"                    \
+	"    \"ClientName\": \"" PROJECT_NAME "\",\n"   \
+	"    \"HostName\": \"%s\",\n"                   \
+	"    \"ID\": \"%s\",\n"                         \
+	"    \"Instance\": 1,\n"                        \
+	"    \"MAC\": \"%s\",\n"                        \
+	"    \"OS\": \"esp32-idf\",\n"                  \
+	"    \"SnapStreamProtocolVersion\": 2,\n"       \
+	"    \"Version\": \"" PROJECT_VERSION "\"\n"    \
 	"}";
 
-	uint32_t len = strlen(snapclient_hello);
-	if (scc_send_hdr(sock, SNAPCAST_MESSAGE_TYPE_HELLO, len + 4) <= 0 ||
-		write(sock, &len, sizeof(len)) <= 0 ||
-		write(sock, snapclient_hello, len) <= 0)
+	char *message;
+	int32_t message_len = asprintf(&message, message_fmt, hostname, mac_str, mac_str);
+
+	free(hostname);
+	if (message_len < 0)
 	{
-		ESP_LOGE(TAG, "hello message failed to send");
+		ESP_LOGI(TAG, "failed to create hello message");
 		return 1;
 	}
-	return 0;
+	
+	ESP_LOGI(TAG, "hello message:\n%s", message);
+	
+	int r = 0;
+	if (scc_send_hdr(sock, SNAPCAST_MESSAGE_TYPE_HELLO, message_len + 4) <= 0 ||
+		write(sock, &message_len, sizeof(message_len)) <= 0 ||
+		write(sock, message, message_len) <= 0)
+	{
+		ESP_LOGE(TAG, "hello message failed to send");
+		r = 1;
+	}
+	free(message);
+	return r;
 }
 
 static int scc_send_msg_time(int sock)

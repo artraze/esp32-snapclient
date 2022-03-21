@@ -8,6 +8,7 @@
 // #define SERVER_IP        "xxx.xxx.xxx.xxx"
 
 #define PROJECT_NAME         "esp32-snapclient"
+#define PROJECT_VERSION      "0.0.1"
 
 #define I2S_NUM              0
 #define GPIO_PIN_I2S_BCK     0
