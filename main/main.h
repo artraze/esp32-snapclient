@@ -7,11 +7,15 @@
 // #define WIFI_PASS        "..."
 // #define SERVER_IP        "xxx.xxx.xxx.xxx"
 
+#define PROJECT_NAME         "esp32-snapclient"
 
 #define I2S_NUM              0
 #define GPIO_PIN_I2S_BCK     0
 #define GPIO_PIN_I2S_LRCK    1
 #define GPIO_PIN_I2S_DOUT    10
+
+#define APP_NVS_NAMESPACE         "esp32-sc-client"
+#define APP_NVS_KEY_HOST_NAME     "hostname"
 
 // Highest system priority seems to be 18 (tcp).  Lowest is ~2 (console, tmrsvc)
 #define APP_PRIO_PLAYER      10
@@ -77,3 +81,5 @@ uint64_t app_time_get_us(void);
 cJSON *util_parse_json(const char *buffer, uint32_t size, const char *log_title);
 uint64_t app_read_systimer_unit1();
 void app_util_init();
+char *util_read_nvs_str(const char *key, const char *dflt);
+void util_write_nvs_str(const char *key, const char *value);

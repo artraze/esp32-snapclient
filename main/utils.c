@@ -1,7 +1,10 @@
 #include "main.h"
 #include <stdlib.h>
+#include <string.h>
 #include "hal/systimer_hal.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_err.h"
 
 static const char *TAG = "app_utils";
 
@@ -35,6 +38,40 @@ uint64_t app_read_systimer_unit1()
 {
 	return systimer_hal_get_counter_value(&s_systimer_hal_context, 1);
 }
+
+char *util_read_nvs_str(const char *key, const char *dflt)
+{
+	esp_err_t r;
+	nvs_handle_t nvs;
+	char *buffer = NULL;
+	r = nvs_open(APP_NVS_NAMESPACE, NVS_READONLY, &nvs);
+	if (r != ESP_ERR_NVS_NOT_FOUND)
+	{
+		ESP_ERROR_CHECK(r);
+		size_t size = 0;
+		esp_err_t r = nvs_get_str(nvs, key, NULL, &size);
+		if (r != ESP_ERR_NVS_NOT_FOUND)
+		{
+			ESP_ERROR_CHECK(r);
+			buffer = malloc(size);
+			if (buffer)
+			{
+				ESP_ERROR_CHECK(nvs_get_str(nvs, key, buffer, &size));
+			}
+		}
+		nvs_close(nvs);
+	}
+	return (buffer ? buffer : strdup(dflt));
+}
+
+void util_write_nvs_str(const char *key, const char *value)
+{
+	nvs_handle_t nvs;
+	ESP_ERROR_CHECK(nvs_open(APP_NVS_NAMESPACE, NVS_READWRITE, &nvs));
+	ESP_ERROR_CHECK(nvs_set_str(nvs, key, value));
+	nvs_close(nvs);
+}
+
 
 void app_util_init()
 {

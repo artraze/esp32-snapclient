@@ -14,9 +14,15 @@
 static esp_console_repl_t *s_repl = NULL;
 
 
-int app_console_set_name(int argc, char **argv)
+int app_console_set_hostname(int argc, char **argv)
 {
-	printf("app_console_set_name %i %s\n", argc, argv[0]);
+	if (argc != 2)
+	{
+		printf("Usage: set_hostname <name>\n");
+		return 1;
+	}
+	util_write_nvs_str(APP_NVS_KEY_HOST_NAME, argv[1]);
+	printf("hostname set to %s\n", argv[1]);
 	return 0;
 }
 
@@ -77,10 +83,10 @@ void app_console_init(void)
 #endif
 	
 	esp_console_cmd_t repl_cmd1 = {
-		.command = "set_name",
-		.help = "Sets the device name (in nvs)",
+		.command = "set_hostname",
+		.help = "Sets the hostname name (in nvs, needs reboot)",
 		.hint = "<name>",
-		.func = app_console_set_name,
+		.func = app_console_set_hostname,
 		.argtable = NULL,
 	};
 	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_console_cmd_register(&repl_cmd1));

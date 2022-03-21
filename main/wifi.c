@@ -60,14 +60,29 @@ void app_wifi_init_sta(void)
 	
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
-	esp_netif_create_default_wifi_sta();
+	
+	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+	esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+
+	// This seems to be the correct way to do this, esp_netif_create_wifi with if_desc set doesn't
+	// work though that field has been described for that purpose, so IDK.
+	char *hostname = util_read_nvs_str(APP_NVS_KEY_HOST_NAME, CONFIG_LWIP_LOCAL_HOSTNAME);
+	if (hostname)
+	{
+		ESP_ERROR_CHECK(esp_netif_set_hostname(netif, hostname));
+		free(hostname);
+	}
+	
+	// esp_netif_set_mac would seem better since it uses the netif, but it doesn't work, so
+	// esp_wifi_set_mac must be used instead
+	// uint8_t mac[6] = { 0xa0, 0x76, 0x4e, 0x01, 0x01, 0x01 };
+	// esp_netif_set_mac(netif, mac);
+	
 	esp_event_handler_instance_t instance_any_id;
 	esp_event_handler_instance_t instance_got_ip;
 	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &app_wifi_event_handler, NULL, &instance_any_id));
 	ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &app_wifi_event_handler, NULL, &instance_got_ip));
-
-	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
