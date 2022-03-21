@@ -26,6 +26,7 @@ static uint64_t s_time_dbg_ticks[TIME_DBG_SAMPLES];
 #define SNAPCAST_MESSAGE_TYPE_HELLO              5
 #define SNAPCAST_MESSAGE_TYPE_STREAM_TAGS        6
 #define SNAPCAST_MESSAGE_TYPE_LAST               6
+#define SNAPCAST_MESSAGE_TYPE_CLIENT_IDLE        1000
 
 typedef struct __attribute__((packed)) ScPacketHdr
 {
@@ -186,48 +187,85 @@ static int scc_send_msg_time(int sock)
 	return 0;
 }
 
-static int scc_recv_hdr(int sock, ScPacketHdr *hdr)
+static int IRAM_ATTR scc_recv_hdr(int sock, ScPacketHdr *hdr)
 {
+	// TODO: This maybe ought to be split between high and low priority tasks.  High pri to
+	// receive the data (to improve timing) and low pri to parse it.  There isn't a whole lot
+	// of CPU pressure, but spamming server commands (at least while they're being printed)
+	// does seem to crush stuff so there is a hierarchy of receive ->  i2s servie -> message
+	// parsing.  The big trick with that is managing the receive queue and preventing it from
+	// overflowing (and/or having multiple queues).
 	while (1)
 	{
-		int r = sock_recv_loop(sock, hdr, sizeof(ScPacketHdr));
-		if (r <= 0)
+		// Because good timesync depends on decent quality reception time observations this needs
+		// to be a little complex.  The basic workflow is:
+		//   nonblocking read to check that there isn't 'stale' data pending
+		//   blocking read to actually try to get the data
+		//   capture nominal timestamp
+		//   read any remaining data
+		// This code ends up being a little ugly any way you slice it, so I went with a loop
+		// to minimize code size.
+		uint64_t recv_time = 0;
+		size_t nrecv   = 0;
+		ssize_t rrecv0 = 0;
+		int recvflags  = MSG_DONTWAIT;
+		uint32_t recv_loops = 0;
+		do
 		{
-			if (errno == EAGAIN)
+			ssize_t rrecv = recv(sock, ((uint8_t *)hdr) + nrecv, sizeof(ScPacketHdr) - nrecv, recvflags);
+			if (rrecv == -1)
 			{
-				ESP_LOGI(TAG, "header recv timed out, looping");
-				// TODO: the time message is kind of a keep-alive so send it on timeout.  This
-				// could probably be in a better spot.
-				scc_send_msg_time(sock);
-#ifdef TIME_DBG_SAMPLES
-				if (s_time_dbg_count > TIME_DBG_SAMPLES / 2)
+				if (errno != EAGAIN)
 				{
-					printf("time_samples=[");
-					for (uint32_t i = 0; i < s_time_dbg_count; i++)
-						printf("(%lli, %lli, %lli),", s_time_dbg_ticks[i], s_time_dbg_local[i], s_time_dbg_remote[i]);
-					printf("]\n");
-					s_time_dbg_count = 0;
+					ESP_LOGE(TAG, "header recv failed: r=%i, errno=%i(%s)", rrecv, errno, strerror(errno));
+					return 1;
 				}
-#endif
-				continue;
+				// If the no data has been received and this wasn't a NOBLOCK then it timed out and
+				// thus should do the idle routine.
+				if (recvflags == 0 && nrecv == 0)
+				{
+					hdr->type = SNAPCAST_MESSAGE_TYPE_CLIENT_IDLE;
+					hdr->size = 0;
+					return 0;
+				}
 			}
-			ESP_LOGE(TAG, "header recv failed: r=%i, errno=%i(%s)", r, errno, strerror(errno));
-			return 1;
-		}
-		// TODO: populate recv time
-		// Add the remote clock instance
-		uint64_t time = TV_2_US(hdr->sent);
-		uint64_t clock = app_read_systimer_unit1();
-		if (xtime_add_observation(&s_state.time_state, time, clock))
+			else
+			{
+				if (nrecv == 0)
+				{
+					recv_time = app_read_systimer_unit1();
+				}
+				nrecv += rrecv;
+			}
+			if (recvflags != 0)
+			{
+				rrecv0 = rrecv;
+				recvflags = 0;
+			}
+			recv_loops++;
+		} while (nrecv < sizeof(ScPacketHdr));
+		
+		// TODO: populate recv time on the header?  Seems kind of silly... The snapcast protocol is
+		// odd.
+		
+		if (rrecv0 <= 0)
 		{
-			app_player_set_time_model(s_state.player, &s_state.time_state.model);
+			uint64_t msg_time = TV_2_US(hdr->sent);
+			if (xtime_add_observation(&s_state.time_state, msg_time, recv_time))
+			{
+				app_player_set_time_model(s_state.player, &s_state.time_state.model);
+			}
+		}
+		else
+		{
+			// ESP_LOGI(TAG, "Discarding time observation due to rcv buffering (recv=%i, dt=%llims, loops=%i)", rrecv0, (recv_time-recv_time0)/16000, recv_loops);
 		}
 #ifdef TIME_DBG_SAMPLES
 		if (s_time_dbg_count < TIME_DBG_SAMPLES)
 		{
-			s_time_dbg_remote[s_time_dbg_count] = time;
-			s_time_dbg_local[s_time_dbg_count] = xtime_calc(&s_state.time_state.model, clock);
-			s_time_dbg_ticks[s_time_dbg_count] = clock;
+			s_time_dbg_remote[s_time_dbg_count] = msg_time;
+			s_time_dbg_local[s_time_dbg_count] = xtime_calc(&s_state.time_state.model, recv_time);
+			s_time_dbg_ticks[s_time_dbg_count] = recv_time;
 			s_time_dbg_count++;
 		}
 #endif
@@ -377,6 +415,21 @@ int scc_recv_stream_tags(ScClientState *state, const char *buffer, uint32_t size
 	return 0;
 }
 
+int scc_recv_idle(int sock)
+{
+#ifdef TIME_DBG_SAMPLES
+	if (s_time_dbg_count > TIME_DBG_SAMPLES / 2)
+	{
+		printf("time_samples=[");
+		for (uint32_t i = 0; i < s_time_dbg_count; i++)
+			printf("(%lli, %lli, %lli),", s_time_dbg_ticks[i], s_time_dbg_local[i], s_time_dbg_remote[i]);
+		printf("]\n");
+		s_time_dbg_count = 0;
+	}
+#endif
+	return scc_send_msg_time(sock);
+}
+
 void app_snapclient_task(void *pvParameters)
 {
 	struct sockaddr_in saddr = { 0 };
@@ -424,7 +477,7 @@ void app_snapclient_task(void *pvParameters)
 			ScPacketHdr hdr;
 			if (scc_recv_hdr(sock, &hdr)) break;
 			// ESP_LOGI(TAG, "got message type=%i, size=%i", hdr.type, hdr.size);
-			if (hdr.type > SNAPCAST_MESSAGE_TYPE_LAST)
+			if (hdr.type > SNAPCAST_MESSAGE_TYPE_LAST && hdr.type != SNAPCAST_MESSAGE_TYPE_CLIENT_IDLE)
 			{
 				// This is maybe unhelpful as it's checked later but does protect against garbage in to a degree
 				ESP_LOGE(TAG, "got unknown message type %i", hdr.type);
@@ -435,20 +488,23 @@ void app_snapclient_task(void *pvParameters)
 				ESP_LOGE(TAG, "message body too large %i", hdr.size);
 				break;
 			}
-			char *body = malloc(hdr.size);
-			if (!body)
+			char *body = NULL;
+			if (hdr.size > 0)
 			{
-				// TODO: this needn't be fatal
-				ESP_LOGE(TAG, "failed to allocate buffer for message body (size=%i, free=%i)", hdr.size, esp_get_free_heap_size());
-				break;
+				body = malloc(hdr.size);
+				if (!body)
+				{
+					// TODO: this needn't be fatal
+					ESP_LOGE(TAG, "failed to allocate buffer for message body (size=%i, free=%i)", hdr.size, esp_get_free_heap_size());
+					break;
+				}
+				r = sock_recv_loop(sock, body, hdr.size);
+				if (r <= 0)
+				{
+					ESP_LOGE(TAG, "message body recv failed: r=%i, errno=%i(%s)", r, errno, strerror(errno));
+					break;
+				}
 			}
-			r = sock_recv_loop(sock, body, hdr.size);
-			if (r <= 0)
-			{
-				ESP_LOGE(TAG, "message body recv failed: r=%i, errno=%i(%s)", r, errno, strerror(errno));
-				break;
-			}
-			
 			switch (hdr.type) {
 				case SNAPCAST_MESSAGE_TYPE_CODEC_HEADER:
 					failed = scc_recv_codec_header(&s_state, body, hdr.size);
@@ -462,8 +518,14 @@ void app_snapclient_task(void *pvParameters)
 				case SNAPCAST_MESSAGE_TYPE_STREAM_TAGS:
 					failed = scc_recv_stream_tags(&s_state, body, hdr.size);
 					break;
-				case SNAPCAST_MESSAGE_TYPE_BASE:
+				case SNAPCAST_MESSAGE_TYPE_CLIENT_IDLE:
+					scc_recv_idle(sock);
+					break;
 				case SNAPCAST_MESSAGE_TYPE_TIME:
+					// Given the open loop sampling method, this message is mostly here as a
+					// keep alive.  The relevant info it sampled in the header reception code.
+					break;
+				case SNAPCAST_MESSAGE_TYPE_BASE:
 				case SNAPCAST_MESSAGE_TYPE_HELLO:
 					// The server shouldn't send these, but it shouldn't be fatal as this
 					// understands them enough to not desync the byte stream or anything.

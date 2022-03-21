@@ -34,7 +34,7 @@ cJSON *util_parse_json(const char *buffer, uint32_t size, const char *log_title)
 	return json;
 }
 
-uint64_t app_read_systimer_unit1()
+uint64_t IRAM_ATTR app_read_systimer_unit1()
 {
 	return systimer_hal_get_counter_value(&s_systimer_hal_context, 1);
 }
