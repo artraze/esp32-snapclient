@@ -12,13 +12,18 @@
 
 static const char *TAG = "app_player";
 
+// Supporting non-16b samples is troublesome and offers little value so just enforce this.
+#define SAMPLE_BITS                                 16
+#define SAMPLE_BYTES                                2
+
 // The maximum allowable frame size, which should be part of the server config.  Note that opus
 // limits this to 120ms, but even less is better (less uncompressed data to queue).
 #define PLAYER_MAX_FRAME_SAMPLES                    3840   // 80ms @ 48kHz
 
 // This size of the static buffer of zeros to use to fill the i2s buffer when there's no audio.
 // The esp32 i2s APIs annoyingly don't offer this functionality, so a static buffer is kept.
-#define PLAYER_DMA_BUF_ZEROS_SAMPLES                200
+// This should be a multiple of 4 so that it can divide by SAMPLE_BYTES and num_channels
+#define PLAYER_DMA_BUF_ZEROS_BYTES                  256
 
 // This represents to minimum number of samples that should be buffered.  That is, this should
 // be large enough to ensure that data remains available between executions of the audio service
@@ -85,6 +90,14 @@ typedef struct RiffHdr
 	uint8_t data[0];
 } RiffHdr;
 
+typedef struct OpusHdr
+{
+	uint32_t opus_4cc;        // 'OPUS' fourcc
+	uint32_t sample_rate;     // 8000, 44100, 48000, etc
+	uint16_t sample_bits;     // 8, 16, etc
+	uint16_t num_channels;    // 1, 2, etc
+} OpusHdr;
+
 typedef struct PlayerState
 {
 	TaskHandle_t manager_task;
@@ -99,6 +112,10 @@ typedef struct PlayerState
 	SemaphoreHandle_t time_mutex;
 	
 	uint8_t codec;
+	uint8_t num_channels;
+	uint32_t sample_rate;
+	uint32_t block_bytes;
+	
 	uint8_t muted;
 	uint8_t volume;
 	uint32_t buffer_ms;
@@ -108,7 +125,7 @@ typedef struct PlayerState
 	FLAC__StreamDecoder *flac_decoder;
 } PlayerState;
 
-static uint8_t s_zero_samples[4 * PLAYER_DMA_BUF_ZEROS_SAMPLES];
+static uint8_t s_zero_samples[PLAYER_DMA_BUF_ZEROS_BYTES];
 static int16_t s_decode_samples[2 * PLAYER_MAX_FRAME_SAMPLES];
 
 static uint64_t scc_time_get_us(const PlayerState *state)
@@ -121,12 +138,13 @@ static uint64_t scc_time_get_us(const PlayerState *state)
 
 static void app_player_fill_zeros(const PlayerState *state, uint32_t samples)
 {
+	uint32_t bytes = samples * state->block_bytes;
 	uint32_t t0 = app_read_systimer_unit1()/16000;
-	while (samples)
+	while (bytes)
 	{
-		size_t size = (samples > PLAYER_DMA_BUF_ZEROS_SAMPLES ? PLAYER_DMA_BUF_ZEROS_SAMPLES : samples);
-		ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, s_zero_samples, 4 * size, &size, 100));
-		samples -= size / 4;
+		size_t size = (bytes > PLAYER_DMA_BUF_ZEROS_BYTES ? PLAYER_DMA_BUF_ZEROS_BYTES : bytes);
+		ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, s_zero_samples, size, &size, 100));
+		bytes -= size;
 	}
 	uint32_t t1 = app_read_systimer_unit1()/16000;
 	if (t1 - t0 > 5)
@@ -181,12 +199,15 @@ int app_player_enqueue_chunk(PlayerState *state, ScPacketWireChunk *chunk)
 		{
 			free(old);
 		}
-		//ESP_LOGW(TAG, "chunk buffer overflow");
+		if (state->sync_status)
+		{
+			ESP_LOGW(TAG, "chunk buffer overflow");
+		}
 	}
 	// This seems to be primarily a fragmentation issue but the heap free is far easier to determine
 	while (esp_get_free_heap_size() < 30000)
 	{
-		ESP_LOGW(TAG, "memory low (%i), discarding chunk", esp_get_free_heap_size());
+		ESP_LOGW(TAG, "memory low (%i), discarding chunk (queue=%i)", esp_get_free_heap_size(), uxQueueMessagesWaiting(state->chunk_queue));
 		ScPacketWireChunk *old;
 		if (xQueueReceive(state->chunk_queue, &old, 0) != pdPASS)
 		{
@@ -256,7 +277,7 @@ void app_player_manager(void *pvParameters)
 		{
 			ESP_LOGI(TAG, "time sync pending");
 		}
-		
+
 		// ESP_LOGE(TAG, "queue chunk (count = %i, free mem = %i)", uxQueueMessagesWaiting(state->chunk_queue), esp_get_free_heap_size());
 		for (ScPacketWireChunk *chunk;
 				state->sync_status &&
@@ -267,7 +288,7 @@ void app_player_manager(void *pvParameters)
 			//ESP_LOGE(TAG, "wire chunk buffer reading len = %i", state->chunk_buf_count);
 			int64_t  play_time     = TV_2_US(chunk->timestamp);
 			int64_t  play_offset  = (state->buffer_ms - state->latency_ms) * 1000LL + play_time - now;
-			int64_t  sample_offset = play_offset * 48000 / 1000000;
+			int64_t  sample_offset = play_offset * state->sample_rate / 1000000;
 			int16_t *samples = NULL;
 			uint32_t nsamples = 0;
 			//ESP_LOGE(TAG, "testing a chunk @ (time-now)==%lli (time=%lli, now=%lli)", play_offset, play_time, now);
@@ -301,9 +322,9 @@ void app_player_manager(void *pvParameters)
 				// PCM is pretty tight.  For best results the chunk_ms on the server should be 20ms
 				// as larger seems to hit heap fragmentation issues.  buffer_ms needs to be ~400ms
 				// in order to ensure enough memory is available overall.
-				nsamples = chunk->size / 4;
-				samples  = chunk->payload;
- 			}
+				nsamples = chunk->size / state->block_bytes;
+				samples  = (int16_t *)chunk->payload;
+			}
 			else if (state->codec == PLAYER_CODEC_OPUS)
 			{
 				assert(state->opus_decoder);
@@ -348,11 +369,11 @@ void app_player_manager(void *pvParameters)
 					ESP_LOGE(TAG, "couldn't trim, the buffer was too small! (skip=%i, nsamples=%i)", skip, nsamples);
 					continue;
 				}
-				samples += 2 * skip;
+				samples += state->num_channels * skip;
 				nsamples -= skip;
 			}
 			int16_t min=0x7FFF, max=-0x8000;
-			for (int i = 0; i < 2 * nsamples; i++)
+			for (int i = 0; i < state->num_channels * nsamples; i++)
 			{
 				int16_t *s = samples + i;
 				*s = ((int32_t)*s) * state->volume / 100 / 8 * (1 - state->muted);
@@ -360,8 +381,8 @@ void app_player_manager(void *pvParameters)
 				if (*s > max) max = *s;
 			}
 			size_t written = 0;
-			ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, samples, 4*nsamples, &written, 100));
-			tx_pending += written / 4;
+			ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_write(I2S_NUM, samples, state->block_bytes * nsamples, &written, 100));
+			tx_pending += written / state->block_bytes;
 			// ESP_LOGE(TAG, "Decoded %i samples, write %i bytes", nsamples, written);
 		}
 		if (tx_pending < PLAYER_PLAYBACK_BUF_SAMPLES_MIN)
@@ -384,7 +405,7 @@ PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t c
 	// and so on.
 	
 	// Should be in BSS and be zeroed, but just to be sure...
-	bzero(s_zero_samples, 4 * PLAYER_DMA_BUF_ZEROS_SAMPLES);
+	bzero(s_zero_samples, PLAYER_DMA_BUF_ZEROS_BYTES);
 	
 	PlayerState *state = malloc(sizeof(PlayerState));
 	bzero(state, sizeof(PlayerState));
@@ -411,6 +432,14 @@ PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t c
 			ESP_LOGI(TAG, "PCM info subchunk='%.4s', size=%i", &riff->sub1_id_4cc, riff->sub1_size);
 			ESP_LOGI(TAG, "PCM info format=%i, channels=%i, sample=%i, byte_rate=%i, align=%i, bps=%i", riff->format, riff->num_channels, riff->sample_rate, riff->byte_rate, riff->block_align, riff->sample_bits);
 			ESP_LOGI(TAG, "PCM info subchunk='%.4s', size=%i", &riff->sub2_id_4cc, riff->sub2_size);
+			if (riff->sample_bits != SAMPLE_BITS)
+			{
+				ESP_LOGE(TAG, "server requested unsupported sample rate (got %i, expected %i)", riff->sample_bits, SAMPLE_BITS);
+				goto exit;
+			}
+			state->sample_rate  = riff->sample_rate;
+			state->num_channels = riff->num_channels;
+			state->block_bytes  = SAMPLE_BYTES * riff->num_channels;
 			break;
 		}
 		case PLAYER_CODEC_FLAC:
@@ -428,8 +457,23 @@ PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t c
 		}
 		case PLAYER_CODEC_OPUS:
 		{
+			if (codec_info_sizes != sizeof(OpusHdr))
+			{
+				ESP_LOGE(TAG, "OPUS codec info unexpected size (got %i, expected %i)", codec_info_sizes, sizeof(OpusHdr));
+				goto exit;
+			}
+			const OpusHdr *info = (const OpusHdr *)codec_info;
+			ESP_LOGI(TAG, "OPUS info 4cc=%.4s, rate=%i, bits=%i, channels=%i", &info->opus_4cc, info->sample_rate, info->sample_bits, info->num_channels);
+			if (info->sample_bits != SAMPLE_BITS)
+			{
+				ESP_LOGE(TAG, "server requested unsupported sample rate (got %i, expected %i)", info->sample_bits, SAMPLE_BITS);
+				goto exit;
+			}
 			int error = OPUS_OK;
-			state->opus_decoder = opus_decoder_create(48000, 2, &error);
+			state->opus_decoder = opus_decoder_create(info->sample_rate, info->num_channels, &error);
+			state->sample_rate  = info->sample_rate;
+			state->num_channels = info->num_channels;
+			state->block_bytes  = SAMPLE_BYTES * info->num_channels;
 			if (error != OPUS_OK)
 			{
 				state->opus_decoder = NULL;
@@ -446,9 +490,9 @@ PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t c
 	ESP_LOGW(TAG, "initial free mem %d", esp_get_free_heap_size());
 	i2s_config_t i2s_config = {
 		.mode = I2S_MODE_MASTER | I2S_MODE_TX,
-		.sample_rate = 48000,
+		.sample_rate = state->sample_rate,
 		.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-		.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+		.channel_format = (state->num_channels == 1 ? I2S_CHANNEL_FMT_ONLY_RIGHT : I2S_CHANNEL_FMT_RIGHT_LEFT),
 		.communication_format = I2S_COMM_FORMAT_STAND_I2S,
 		.dma_buf_count = PLAYER_DMA_BUF_COUNT,
 		.dma_buf_len = PLAYER_DMA_BUF_SIZE_SAMPLES,
@@ -473,7 +517,7 @@ PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t c
 	xTaskCreate(&app_player_manager, "player_manager", 1024*16, (void *)state, APP_PRIO_PLAYER, &state->manager_task);
 	ESP_LOGW(TAG, "with player_manager driver free mem %d", esp_get_free_heap_size());
 	
-	ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_set_clk(I2S_NUM, 48000, 16, 2));
+	ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_set_clk(I2S_NUM, state->sample_rate, SAMPLE_BITS, 2));
 	
 	return state;
 exit:
