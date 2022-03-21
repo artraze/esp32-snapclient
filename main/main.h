@@ -13,6 +13,20 @@
 #define GPIO_PIN_I2S_LRCK    1
 #define GPIO_PIN_I2S_DOUT    10
 
+// This is handy for configuration of the device, but sadly the USB_JTAG implementation is fairly
+// buggy.  In particular, vfs_dev_usb_serial_jtag doesn't correctly support O_NONBLOCK so once
+// the esp_console starts and switches to "driver" based usb_jtag it becomes permanently blocking.
+// That might not be terrible, but the USB logic, unlike a real UART, won't send data if it's not
+// connected.  Thus, the device stalls out after a ESP_LOG or two.
+// This attempts to detect if the USB_JTAG is connected before enabling the console, but it doesn't
+// seem like there is a robust way (see comments in main.c) so this provides a way to disable the
+// console startup.
+// ALSO: This sets the UART to blocking mode, which may tanks the ESP_LOG performance.  Not sure...
+// TODO: test that
+#define APP_USE_CONSOLE
+
+
+
 #define TV_2_US(tv)                              (((tv##_sec) * 1000000ULL) + (tv##_usec))
 
 #define LOG_FORMAT(letter, format)  LOG_COLOR_ ## letter #letter " (%u) %s: " format LOG_RESET_COLOR "\n"
@@ -38,6 +52,10 @@ void app_player_set_time_model(struct PlayerState *state, const struct TimeModel
 int app_player_enqueue_chunk(struct PlayerState *state, struct ScPacketWireChunk *chunk);
 struct PlayerState *app_player_create(uint8_t codec, const void *codec_info, uint32_t codec_info_sizes);
 void app_player_destroy(struct PlayerState *state);
+
+// console.c
+void app_console_init(void);
+void app_console_start(void);
 
 // snapclient.c
 void app_snapclient_init(void);
