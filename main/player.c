@@ -276,7 +276,7 @@ void app_player_manager(void *pvParameters)
 				// In theory there could be useful samples at the end of the chunk even if the start
 				// is negative, but the buffer is underrunning so better to try and start fresh than
 				// salvage the tail of a chunk.
-				ESP_LOGW(TAG, "discarded a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, state->buffer_ms, state->latency_ms);
+				ESP_LOGW(TAG, "discarded chunk @ sample=%lli, time==%lli (time=%lli, now=%lli, buffer=%i, latency=%i, queue=%i)", sample_offset, play_offset, play_time, now, state->buffer_ms, state->latency_ms, uxQueueMessagesWaiting(state->chunk_queue));
 				continue;
 			}
 			if (sample_offset > PLAYER_PLAYBACK_BUF_SAMPLES_MIN + PLAYER_PLAYBACK_SAMPLE_JITTER_MIN)
@@ -292,14 +292,8 @@ void app_player_manager(void *pvParameters)
 					ESP_LOGE(TAG, "discarded a future chunk due to full buffer?!");
 					free(chunk);
 				}
-				ESP_LOGI(TAG, "replaced future buf @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%is)", sample_offset, play_offset, play_time, now, state->buffer_ms, state->latency_ms);
+				ESP_LOGI(TAG, "replaced future buf @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli, buffer=%i, latency=%i, queue=%i)", sample_offset, play_offset, play_time, now, state->buffer_ms, state->latency_ms, uxQueueMessagesWaiting(state->chunk_queue));
 				break;
-			}
-			if (tx_pending + PLAYER_PLAYBACK_SAMPLE_JITTER_MIN < sample_offset)
-			{
-				ESP_LOGI(TAG, "padding for chunk play (tx_pending=%i, sample_offset=%i", tx_pending, sample_offset);
-				app_player_fill_zeros(state, sample_offset - tx_pending);
-				tx_pending = sample_offset;
 			}
 			//ESP_LOGI(TAG, "playing a chunk @ sample_offset=%lli, (time-now)==%lli (time=%lli, now=%lli)", sample_offset, play_offset, play_time, now);
 			if (state->codec == PLAYER_CODEC_PCM)
@@ -338,6 +332,24 @@ void app_player_manager(void *pvParameters)
 			{
 				ESP_LOGE(TAG, "Unsupported CODEC %i", state->codec);
 				continue;
+			}
+			if (tx_pending + PLAYER_PLAYBACK_SAMPLE_JITTER_MIN < sample_offset)
+			{
+				ESP_LOGI(TAG, "padding for chunk play (tx_pending=%i, sample_offset=%i", tx_pending, sample_offset);
+				app_player_fill_zeros(state, sample_offset - tx_pending);
+				tx_pending = sample_offset;
+			}
+			else if (tx_pending > sample_offset + PLAYER_PLAYBACK_SAMPLE_JITTER_MIN)
+			{
+				ESP_LOGI(TAG, "trimming for chunk play (tx_pending=%i, sample_offset=%i", tx_pending, sample_offset);
+				int32_t skip = tx_pending - sample_offset;
+				if (skip >= nsamples)
+				{
+					ESP_LOGE(TAG, "couldn't trim, the buffer was too small! (skip=%i, nsamples=%i)", skip, nsamples);
+					continue;
+				}
+				samples += 2 * skip;
+				nsamples -= skip;
 			}
 			int16_t min=0x7FFF, max=-0x8000;
 			for (int i = 0; i < 2 * nsamples; i++)
